@@ -818,7 +818,7 @@ function App() {
                             )}
                           </p>
                           <p className="mt-1 text-xs text-slate-300">
-                            {candidate.distanceMiles} mi | {candidate.availableBeds} beds avail | {Math.round(candidate.utilization * 100)}% util | {candidate.waitMins} min wait
+                            {candidate.distanceMiles} mi ({candidate.durationMins} min) | {candidate.availableBeds} beds avail ({Math.round(candidate.utilization * 100)}% util) | {candidate.waitMins} min wait
                           </p>
                           {index === 0 && route.top3[1] && buildPickedOverDiff(route.top3[0], route.top3[1]) && (
                             <p className="mt-1 text-[11px] italic text-cyan-300/80">
