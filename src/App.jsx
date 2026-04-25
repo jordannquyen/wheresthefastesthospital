@@ -294,7 +294,7 @@ function App() {
   if (!mapsApiKey) {
     return (
       <main className="screen bg-grid text-slate-100">
-        <div className="mx-auto max-w-3xl rounded-2xl border border-cyan-400/40 bg-slate-900/90 p-8 shadow-2xl shadow-cyan-600/20">
+        <div className="mx-auto max-w-3xl rounded-md border border-cyan-400/40 bg-slate-900/90 p-8 shadow-2xl shadow-cyan-600/20">
           <p className="font-mono text-xs uppercase tracking-[0.22em] text-cyan-300">wtf-hospital</p>
           <h1 className="mt-2 text-3xl font-semibold">Google API key required</h1>
           <p className="mt-3 text-slate-300">Add GOOGLE_MAPS_API_KEY to your .env and restart.</p>
@@ -312,18 +312,18 @@ function App() {
   return (
     <main className="screen bg-grid text-slate-100">
       <section className="mx-auto grid h-full w-full max-w-[1500px] grid-rows-[auto_auto_1fr] gap-4 p-4 lg:p-6">
-        <header className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
+        <header className="rounded-xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
           <h1 className="text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
           <p className="mt-1 text-sm text-slate-300">a tool for emts to optimize saving lives</p>
         </header>
 
-        <nav className="flex gap-1 rounded-2xl border border-slate-700 bg-slate-950/70 p-1">
+        <nav className="flex gap-1 rounded-xl border border-slate-700 bg-slate-950/70 p-1">
           {tabs.map((tab) => (
             <button
               key={tab}
               type="button"
               onClick={() => setActiveTab(tab)}
-              className={`flex-1 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+              className={`flex-1 rounded-lg px-4 py-2 text-sm font-semibold transition ${
                 activeTab === tab ? "bg-cyan-500 text-slate-950" : "text-slate-300 hover:bg-slate-800"
               }`}
             >
@@ -334,7 +334,7 @@ function App() {
 
         {activeTab === "emt" && (
           <section className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[2fr_1fr]">
-            <article className="relative min-h-[420px] overflow-hidden rounded-2xl border border-slate-700 bg-slate-950/70 shadow-xl shadow-black/35">
+            <article className="relative min-h-[420px] overflow-hidden rounded-xl border border-slate-700 bg-slate-950/70 shadow-xl shadow-black/35">
               {isLoaded && (
                 <GoogleMap
                   mapContainerStyle={mapContainerStyle}
@@ -436,7 +436,7 @@ function App() {
                 </GoogleMap>
               )}
 
-              <div className="pointer-events-none absolute bottom-3 right-3 max-w-[240px] rounded-xl border border-slate-600/90 bg-slate-950/85 p-3 backdrop-blur">
+              <div className="pointer-events-none absolute bottom-3 right-3 max-w-[240px] rounded-lg border border-slate-600/90 bg-slate-950/85 p-3 backdrop-blur">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-200">Legend</p>
                 <ul className="mt-2 space-y-1.5 text-xs text-slate-300">
                   <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" />Green: &lt;50% util</li>
@@ -449,7 +449,7 @@ function App() {
             </article>
 
             <aside className="grid min-h-0 grid-rows-[auto_auto_1fr] gap-4">
-              <section className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+              <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
                 <h2 className="text-lg font-semibold">Current Location</h2>
                 <p className="mt-1 text-sm text-slate-300">Use address autofill or click the map, then compute top 3 hospitals.</p>
                 <form className="mt-3 grid grid-cols-1 gap-2" onSubmit={handleLocationSubmit}>
@@ -463,7 +463,7 @@ function App() {
                         ref={addressInputRef}
                         type="text"
                         onChange={(e) => setLocationAddress(e.target.value)}
-                        className="w-full rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
+                        className="w-full rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
                         placeholder="Start typing an address"
                       />
                     </Autocomplete>
@@ -472,17 +472,17 @@ function App() {
                       type="text"
                       value={locationAddress}
                       onChange={(e) => setLocationAddress(e.target.value)}
-                      className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
+                      className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
                       placeholder="Loading autocomplete..."
                     />
                   )}
-                  <select value={specification} onChange={(e) => setSpecification(e.target.value)} className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
+                  <select value={specification} onChange={(e) => setSpecification(e.target.value)} className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
                     <option value="">Specification (optional)</option>
                     <option value="stemi">STEMI</option>
                     <option value="stroke">Stroke</option>
                     <option value="trauma">Trauma</option>
                   </select>
-                  <select value={insurance} onChange={(e) => setInsurance(e.target.value)} className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
+                  <select value={insurance} onChange={(e) => setInsurance(e.target.value)} className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
                     <option value="">Insurance (optional)</option>
                     <option value="Medicare">Medicare</option>
                     <option value="Medicaid">Medicaid</option>
@@ -492,7 +492,7 @@ function App() {
                     <option value="Cigna">Cigna</option>
                     <option value="Kaiser">Kaiser</option>
                   </select>
-                  <button type="submit" className="rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400">
+                  <button type="submit" className="rounded-md bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400">
                     Get Top 3 Hospitals
                   </button>
                 </form>
@@ -501,7 +501,7 @@ function App() {
               </section>
 
               {selectedHospital && (
-                <section className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+                <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
                   <h2 className="text-lg font-semibold">Selected Hospital</h2>
                   <div className="mt-2 space-y-1.5 text-sm text-slate-200">
                     <p className="font-semibold text-slate-100">{selectedHospital.name}</p>
@@ -525,23 +525,23 @@ function App() {
                 </section>
               )}
 
-              <section className="min-h-0 overflow-auto rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+              <section className="min-h-0 overflow-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4">
                 <h2 className="text-lg font-semibold">Top 3 Hospital Choices</h2>
                 {!route && <p className="mt-2 text-sm text-slate-300">Enter a location to get ranked recommendations.</p>}
                 {route && (
                   <div className="mt-2 space-y-3 text-sm">
-                    <p className="rounded-lg border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
+                    <p className="rounded-md border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
                       Model: <span className="font-mono text-cyan-300">{route.model}</span>
                     </p>
                     {route.specification && (
-                      <p className="rounded-lg border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
+                      <p className="rounded-md border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
                         Spec: <span className="font-mono text-cyan-300">{route.specification.toUpperCase()}</span>
                       </p>
                     )}
                     {route.closest && <p>Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)</p>}
                     <div className="space-y-2 pt-1">
                       {(route.top3 || []).map((candidate, index) => (
-                        <div key={candidate.id} className="rounded-lg border border-slate-700 bg-slate-900/60 p-2">
+                        <div key={candidate.id} className="rounded-md border border-slate-700 bg-slate-900/60 p-2">
                           <p className="flex items-center gap-2 font-medium text-slate-100">
                             <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 text-sm font-bold text-cyan-300">{rankLabels[index]}</span>
                             {candidate.name}
@@ -563,12 +563,12 @@ function App() {
                       <button
                         type="button"
                         onClick={handleDispatch}
-                        className="mt-2 w-full rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
+                        className="mt-2 w-full rounded-md bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
                       >
                         Dispatch Patient to #1 Recommended
                       </button>
                     ) : (
-                      <div className={`mt-2 rounded-lg border p-3 text-sm ${dispatchPanelClass(dispatch.status)}`}>
+                      <div className={`mt-2 rounded-md border p-3 text-sm ${dispatchPanelClass(dispatch.status)}`}>
                         {dispatch.status === "active" && (
                           <>
                             <p className="font-semibold">Dispatched → {dispatch.currentHospital?.hospitalName}</p>
@@ -619,7 +619,7 @@ function AdminView({ hospitals, onOverride }) {
   const statusOptions = ["Open", "Saturation", "Diversion"];
   return (
     <section className="min-h-0 overflow-auto">
-      <div className="mb-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
+      <div className="mb-4 rounded-md border border-amber-500/30 bg-amber-500/10 p-4">
         <p className="text-sm font-semibold text-amber-200">Demo Admin — Hospital Status Overrides</p>
         <p className="mt-1 text-xs text-amber-300/70">Force hospital status to test the diversion chain. Overrides block auto-approve so requests come in as pending.</p>
       </div>
@@ -628,7 +628,7 @@ function AdminView({ hospitals, onOverride }) {
       )}
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {hospitals.map((h) => (
-          <div key={h.hospitalId} className="rounded-[28px] border border-slate-700 bg-slate-900/60 p-4">
+          <div key={h.hospitalId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
             <p className="font-semibold text-slate-100">{h.hospitalName ?? h.hospitalId}</p>
             <div className="mt-1 flex items-center gap-2 text-xs">
               {h.override && (
@@ -643,7 +643,7 @@ function AdminView({ hospitals, onOverride }) {
                   key={s}
                   type="button"
                   onClick={() => onOverride(h.hospitalId, h.override === s ? null : s)}
-                  className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                  className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
                     h.override === s
                       ? statusBadgeColor(s)
                       : "border border-slate-700 bg-slate-800 text-slate-300 hover:border-slate-500"
@@ -663,25 +663,25 @@ function AdminView({ hospitals, onOverride }) {
 function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFilter, onFilterChange }) {
   return (
     <section className="grid min-h-0 grid-rows-[auto_1fr] gap-4">
-      <div className="flex flex-col gap-3 rounded-2xl border border-slate-700 bg-slate-950/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-3 rounded-xl border border-slate-700 bg-slate-950/70 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-lg font-semibold">Incoming Patient Requests</h2>
           <p className="mt-1 text-sm text-slate-300">EMT notifications routed to this hospital. Auto-approved when capacity is healthy.</p>
         </div>
-        <select value={selectedHospitalFilter} onChange={(e) => onFilterChange(e.target.value)} className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-100">
+        <select value={selectedHospitalFilter} onChange={(e) => onFilterChange(e.target.value)} className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-100">
           <option value="">All hospitals</option>
           {nodes.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}
         </select>
       </div>
       <div className="min-h-0 overflow-auto">
         {requests.length === 0 ? (
-          <div className="flex h-full items-center justify-center rounded-2xl border border-slate-700 bg-slate-950/70">
+          <div className="flex h-full items-center justify-center rounded-xl border border-slate-700 bg-slate-950/70">
             <p className="text-sm text-slate-400">No incoming requests{selectedHospitalFilter ? " for this hospital" : ""}.</p>
           </div>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {requests.map((req) => (
-              <div key={req.requestId} className="rounded-[28px] border border-slate-700 bg-slate-900/60 p-4">
+              <div key={req.requestId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
                 <div className="flex flex-wrap items-center gap-2">
                   {req.patientSpec && <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1 text-xs font-semibold uppercase text-cyan-200">{req.patientSpec}</span>}
                   {req.escalatedFrom && <span className="rounded-full border border-orange-400/30 bg-orange-400/10 px-2.5 py-1 text-xs font-semibold text-orange-200">Rerouted from {req.escalatedFrom}</span>}
@@ -696,8 +696,8 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
                 </div>
                 {req.status === "pending" && (
                   <div className="mt-4 flex gap-2">
-                    <button type="button" onClick={() => onAccept(req.requestId)} className="flex-1 rounded-xl bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30">Accept</button>
-                    <button type="button" onClick={() => onDivert(req.requestId)} className="flex-1 rounded-xl bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/30">Divert</button>
+                    <button type="button" onClick={() => onAccept(req.requestId)} className="flex-1 rounded-md bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30">Accept</button>
+                    <button type="button" onClick={() => onDivert(req.requestId)} className="flex-1 rounded-md bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/30">Divert</button>
                   </div>
                 )}
               </div>
