@@ -7,12 +7,14 @@ import multer from "multer";
 import { Client } from "@googlemaps/google-maps-services-js";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import { MongoClient } from "mongodb";
+import Anthropic from "@anthropic-ai/sdk";
 
 dotenv.config();
 
 const requests = {};
 const dispatches = {};
 const hospitalOverrides = {}; // { [hospitalId]: "Open" | "Saturation" | "Diversion" }
+const escalationTimers = {}; // { [requestId]: timeoutId } — cleared on accept/divert
 
 const app = express();
 const googleMapsClient = new Client({});
@@ -28,6 +30,9 @@ const uploadAudio = multer({
 });
 const defaultVoiceId = process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
 
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+const anthropic = anthropicApiKey ? new Anthropic({ apiKey: anthropicApiKey }) : null;
+
 const mongoUri = process.env.MONGODB_URI;
 const mongoDbName = process.env.MONGODB_DB_NAME;
 
@@ -36,6 +41,12 @@ let patientsCollection = null;
 
 app.use(cors());
 app.use(express.json());
+
+// Express 4 doesn't catch async route errors automatically — wrap every handler.
+const ah = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+// Keep the process alive if something slips through outside a request.
+process.on("unhandledRejection", (reason) => console.error("Unhandled rejection:", reason));
 
 function getPatientsCollectionOrNull() {
   return patientsCollection;
@@ -221,7 +232,7 @@ async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
     socrataUrl.searchParams.set("state", "CA");
     socrataUrl.searchParams.set("$order", "collection_week DESC");
 
-    const response = await fetch(socrataUrl.toString(), { timeout: 5000 });
+    const response = await fetch(socrataUrl.toString(), { signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw new Error(`Socrata API returned ${response.status}`);
 
     const raw = await response.json();
@@ -290,7 +301,7 @@ async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit 
     socrataUrl.searchParams.set("$where", `city='${city}'`);
     socrataUrl.searchParams.set("$order", "collection_week DESC");
 
-    const response = await fetch(socrataUrl.toString(), { timeout: 5000 });
+    const response = await fetch(socrataUrl.toString(), { signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw new Error(`Socrata API returned ${response.status}`);
 
     const raw = await response.json();
@@ -334,12 +345,71 @@ app.get("/api/health", (_req, res) => {
     provider: googleMapsApiKey ? "google" : "fallback",
     voice: Boolean(elevenlabs),
     mongo: getPatientsCollectionOrNull() ? "connected" : "not-configured",
+    smartExtract: Boolean(anthropic),
   });
+});
+
+app.post("/api/extract-patient", async (req, res) => {
+  if (!anthropic) {
+    return res.status(503).json({ error: "ANTHROPIC_API_KEY not configured" });
+  }
+  const { transcript } = req.body ?? {};
+  if (!transcript || typeof transcript !== "string") {
+    return res.status(400).json({ error: "transcript is required" });
+  }
+
+  const prompt = `Extract structured patient information from this EMT radio transcript. Return ONLY a valid JSON object, no explanation.
+
+Schema (use null for any field not mentioned):
+{
+  "name": string | null,
+  "age": number | null,
+  "sex": "male" | "female" | null,
+  "specification": "stemi" | "stroke" | "trauma" | null,
+  "insurance": "Government" | "Kaiser" | null,
+  "chiefComplaint": string | null,
+  "mechanism": string | null,
+  "mentalStatus": string | null,
+  "interventions": string[] | null,
+  "vitals": { "bp": string | null, "hr": number | null, "spo2": number | null, "rr": number | null },
+  "location": { "phrase": string } | null
+}
+
+Field rules:
+- specification: "stemi" for cardiac/chest emergencies, "stroke" for neurological stroke, "trauma" for physical injury — null for anything else
+- insurance: "Government" for Medicare/Medicaid/government plans, "Kaiser" for Kaiser Permanente — null if not mentioned
+- vitals.bp: "systolic/diastolic" string e.g. "120/80"
+- location.phrase: geocodable address or landmark where the patient is
+- chiefComplaint: primary presenting problem in plain language (NOT insurance, NOT demographics)
+- interventions: treatments already given, e.g. ["O2", "IV access", "aspirin"]
+
+Transcript: ${JSON.stringify(transcript)}`;
+
+  try {
+    const message = await anthropic.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 512,
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    const text = message.content[0]?.text ?? "";
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error("No JSON in Claude response");
+    const extracted = JSON.parse(jsonMatch[0]);
+
+    if (!extracted.vitals) extracted.vitals = { bp: null, hr: null, spo2: null, rr: null };
+    extracted.transcript = transcript.trim();
+
+    return res.json(extracted);
+  } catch (err) {
+    console.error("extract-patient error:", err);
+    return res.status(500).json({ error: "Extraction failed" });
+  }
 });
 
 // --- Patient endpoints ---
 
-app.post("/api/patients", async (req, res) => {
+app.post("/api/patients", ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -359,9 +429,9 @@ app.post("/api/patients", async (req, res) => {
   await collection.insertOne(patient);
   const { _id, ...safePatient } = patient;
   return res.status(201).json({ patient: safePatient });
-});
+}));
 
-app.get("/api/patients", async (req, res) => {
+app.get("/api/patients", ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -381,9 +451,9 @@ app.get("/api/patients", async (req, res) => {
     .toArray();
 
   return res.json({ patients, count: patients.length });
-});
+}));
 
-app.get("/api/patients/:patientId", async (req, res) => {
+app.get("/api/patients/:patientId", ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -395,9 +465,9 @@ app.get("/api/patients/:patientId", async (req, res) => {
   );
   if (!patient) return res.status(404).json({ error: "patient not found" });
   return res.json({ patient });
-});
+}));
 
-app.patch("/api/patients/:patientId", async (req, res) => {
+app.patch("/api/patients/:patientId", ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -418,14 +488,14 @@ app.patch("/api/patients/:patientId", async (req, res) => {
 
   if (!result) return res.status(404).json({ error: "patient not found" });
   return res.json({ patient: result });
-});
+}));
 
-app.get("/api/nodes", async (req, res) => {
+app.get("/api/nodes", ah(async (req, res) => {
   const { city, state = "CA" } = req.query;
   if (!city) return res.json({ nodes: [] });
   const hospitals = await fetchAndCacheHospitals(city.toUpperCase(), state);
   res.json({ nodes: hospitals });
-});
+}));
 
 app.post("/api/hospitals-by-coords", async (req, res) => {
   const { lat, lng } = req.body ?? {};
@@ -441,7 +511,7 @@ app.post("/api/hospitals-by-coords", async (req, res) => {
   }
 });
 
-app.get("/api/telemetry", async (req, res) => {
+app.get("/api/telemetry", ah(async (req, res) => {
   const { city, state = "CA" } = req.query;
   if (!city) return res.json({ updatedAt: new Date().toISOString(), nodes: {} });
 
@@ -458,7 +528,7 @@ app.get("/api/telemetry", async (req, res) => {
     ])
   );
   res.json({ updatedAt: new Date().toISOString(), nodes: telemetryNodes });
-});
+}));
 
 app.get("/api/hospitals", async (req, res) => {
   const { city, state = "CA", limit = 100 } = req.query;
@@ -468,7 +538,7 @@ app.get("/api/hospitals", async (req, res) => {
     socrataUrl.searchParams.set("state", state);
     if (city) socrataUrl.searchParams.set("$where", `city='${city.toUpperCase()}'`);
 
-    const response = await fetch(socrataUrl.toString(), { timeout: 5000 });
+    const response = await fetch(socrataUrl.toString(), { signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw new Error(`Socrata API returned ${response.status}`);
 
     const hospitals = await response.json();
@@ -664,6 +734,11 @@ app.patch("/api/requests/:requestId", (req, res) => {
 
   record.status = status;
 
+  if (escalationTimers[requestId]) {
+    clearTimeout(escalationTimers[requestId]);
+    delete escalationTimers[requestId];
+  }
+
   const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
   if (dispatch) {
     if (status === "accepted") {
@@ -702,6 +777,12 @@ app.delete("/api/admin/override/:hospitalId", (req, res) => {
 
 app.get("/api/admin/overrides", (_req, res) => {
   return res.json({ overrides: hospitalOverrides });
+});
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error("Unhandled route error:", err);
+  if (!res.headersSent) res.status(500).json({ error: "Internal server error" });
 });
 
 initializeMongo()
@@ -771,6 +852,28 @@ async function computeRoute(origin, insurance) {
 
 // --- Helper functions ---
 
+function escalateRequest(requestId) {
+  const record = requests[requestId];
+  if (!record || record.status !== "pending") return;
+  delete escalationTimers[requestId];
+
+  record.status = "diverted";
+  record.timedOut = true;
+
+  const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
+  if (dispatch) {
+    const nextIndex = dispatch.currentIndex + 1;
+    if (nextIndex < dispatch.chain.length) {
+      dispatch.currentIndex = nextIndex;
+      const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
+      dispatch.activeRequestId = nextRequestId;
+      if (requests[nextRequestId].status === "accepted") dispatch.status = "accepted";
+    } else {
+      dispatch.status = "exhausted";
+    }
+  }
+}
+
 function createRequest(dispatch, chainIndex, escalatedFromName) {
   const entry = dispatch.chain[chainIndex];
   const autoApproved = shouldAutoApprove(entry.hospitalId, entry);
@@ -789,14 +892,17 @@ function createRequest(dispatch, chainIndex, escalatedFromName) {
     autoApproved,
     requestedAt: new Date().toISOString(),
   };
+  if (!autoApproved) {
+    escalationTimers[requestId] = setTimeout(() => escalateRequest(requestId), 60_000);
+  }
   return requestId;
 }
 
 function shouldAutoApprove(hospitalId, nodeMetrics) {
   const override = hospitalOverrides[hospitalId];
   const utilization = nodeMetrics?.utilization ?? 0;
-  // Only auto-accept green-level hospitals (<50% util). Respect explicit "Open" admin overrides.
-  const isGreen = override === "Open" || (!override && utilization < 0.5);
+  // Only auto-accept green-level hospitals (<70% util). Respect explicit "Open" admin overrides.
+  const isGreen = override === "Open" || (!override && utilization < 0.7);
   return isGreen
     && (nodeMetrics?.availableBeds ?? 0) >= 5
     && (nodeMetrics?.waitMins ?? 999) <= 60;
@@ -808,7 +914,7 @@ function getEffectiveStatus(hospitalId, utilization) {
 
 function deriveStatus(utilization) {
   if (utilization >= 0.97) return "Diversion";
-  if (utilization >= 0.80) return "Saturation";
+  if (utilization >= 0.70) return "Saturation";
   return "Open";
 }
 
