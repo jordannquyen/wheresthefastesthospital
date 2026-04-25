@@ -18,6 +18,11 @@ const googleMapsApiKey = process.env.GOOGLE_MAPS_API_KEY;
 app.use(cors());
 app.use(express.json());
 
+function toTitleCase(str) {
+  if (!str) return str;
+  return str.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
 function deduplicateByLatestWeek(rawRecords) {
   const seen = new Map();
   for (const h of rawRecords) {
@@ -57,7 +62,7 @@ async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
 
       return {
         id: h.hospital_pk,
-        name: h.hospital_name,
+        name: toTitleCase(h.hospital_name),
         lat: hospitalLat,
         lng: hospitalLng,
         address: h.address,
@@ -121,7 +126,7 @@ async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit 
 
       return {
         id: h.hospital_pk,
-        name: h.hospital_name,
+        name: toTitleCase(h.hospital_name),
         lat: coords ? coords[1] : null,
         lng: coords ? coords[0] : null,
         address: h.address,
@@ -212,7 +217,7 @@ app.get("/api/hospitals", async (req, res) => {
         const coords = h.geocoded_hospital_address?.coordinates;
         return {
           id: h.hospital_pk,
-          name: h.hospital_name,
+          name: toTitleCase(h.hospital_name),
           address: h.address,
           city: h.city,
           state: h.state,
