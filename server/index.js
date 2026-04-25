@@ -593,7 +593,7 @@ app.post("/api/tts", async (req, res) => {
 // --- Dispatch endpoints ---
 
 app.post("/api/dispatch", (req, res) => {
-  const { chain, insurance } = req.body ?? {};
+  const { chain, insurance, patientSummary } = req.body ?? {};
   if (!Array.isArray(chain) || chain.length === 0) {
     return res.status(400).json({ error: "chain must be a non-empty array" });
   }
@@ -604,6 +604,7 @@ app.post("/api/dispatch", (req, res) => {
     chain,
     currentIndex: 0,
     insurance: insurance ?? null,
+    patientSummary: patientSummary ?? null,
     activeRequestId: null,
     status: "active",
     createdAt: new Date().toISOString(),
@@ -781,6 +782,7 @@ function createRequest(dispatch, chainIndex, escalatedFromName) {
     hospitalId: entry.hospitalId,
     hospitalName: entry.hospitalName,
     insurance: dispatch.insurance,
+    patientSummary: dispatch.patientSummary ?? null,
     etaMins: entry.etaMins,
     escalatedFrom: escalatedFromName ?? null,
     status: autoApproved ? "accepted" : "pending",

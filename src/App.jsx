@@ -394,7 +394,7 @@ function App() {
     const res = await fetch("/api/dispatch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chain, insurance: effectiveInsurance || insurance || null }),
+      body: JSON.stringify({ chain, insurance: effectiveInsurance || insurance || null, patientSummary: patientSummary ?? null }),
     });
     if (!res.ok) return null;
     const dispatchMeta = await res.json();
@@ -956,6 +956,20 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
                 <div className="mt-2 space-y-1 text-sm text-slate-300">
                   <p>ETA: <span className="text-slate-100">{req.etaMins != null ? `${req.etaMins} min` : "--"}</span></p>
                   {req.insurance && <p>Insurance: <span className="text-slate-100">{req.insurance}</span></p>}
+                  {req.patientSummary && (
+                    <div className="mt-2 rounded-lg border border-slate-700 bg-slate-950/60 p-2 space-y-0.5 text-xs">
+                      {req.patientSummary.name && <p>Patient: <span className="text-slate-100">{req.patientSummary.name}</span></p>}
+                      {(req.patientSummary.age || req.patientSummary.sex) && (
+                        <p>{[req.patientSummary.age ? `${req.patientSummary.age}y` : null, req.patientSummary.sex].filter(Boolean).join(", ")}</p>
+                      )}
+                      {req.patientSummary.vitals?.bp && <p>BP: <span className="text-slate-100">{req.patientSummary.vitals.bp}</span></p>}
+                      {req.patientSummary.vitals?.hr && <p>HR: <span className="text-slate-100">{req.patientSummary.vitals.hr} bpm</span></p>}
+                      {req.patientSummary.vitals?.spo2 && <p>SpO2: <span className="text-slate-100">{req.patientSummary.vitals.spo2}%</span></p>}
+                      {req.patientSummary.transcript && (
+                        <p className="mt-1 italic text-slate-400 leading-relaxed">"{req.patientSummary.transcript}"</p>
+                      )}
+                    </div>
+                  )}
                   <p className="font-mono text-xs text-slate-500">{new Date(req.requestedAt).toLocaleTimeString()}</p>
                 </div>
                 {req.status === "pending" && (
