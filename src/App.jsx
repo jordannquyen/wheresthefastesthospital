@@ -335,7 +335,7 @@ function App() {
 
       if (resolvedOrigin) {
         const routeData = await requestRecommendations(resolvedOrigin, { insurance: summary.insurance });
-        const dispatchData = await autoDispatch(routeData, summary.insurance);
+        const dispatchData = await autoDispatch(routeData, summary.insurance, summary);
         const hospital = dispatchData?.currentHospital;
         const req = dispatchData?.activeRequest;
         const eta = hospital?.etaMins ?? "unknown";
@@ -394,7 +394,7 @@ function App() {
     return data;
   }
 
-  async function autoDispatch(routeData, effectiveInsurance) {
+  async function autoDispatch(routeData, effectiveInsurance, summaryData) {
     if (!routeData?.top3?.length) return null;
     const chain = routeData.top3.map((c) => ({
       hospitalId: c.id,
@@ -407,7 +407,7 @@ function App() {
     const res = await fetch("/api/dispatch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chain, insurance: effectiveInsurance || insurance || null, patientSummary: patientSummary ?? null }),
+      body: JSON.stringify({ chain, insurance: effectiveInsurance || insurance || null, patientSummary: summaryData ?? null }),
     });
     if (!res.ok) return null;
     const dispatchMeta = await res.json();
