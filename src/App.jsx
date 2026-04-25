@@ -58,14 +58,6 @@ function App() {
       .catch(() => setVoiceEnabled(false));
   }, []);
 
-  // Keep the (uncontrolled) autocomplete input in sync with locationAddress
-  // so voice-resolved or programmatically set addresses appear in the field.
-  useEffect(() => {
-    if (addressInputRef.current && addressInputRef.current.value !== locationAddress) {
-      addressInputRef.current.value = locationAddress ?? "";
-    }
-  }, [locationAddress]);
-
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
     googleMapsApiKey: mapsApiKey || "",
@@ -77,26 +69,44 @@ function App() {
     return () => clearInterval(pulseInterval);
   }, []);
 
+  // Run once after Google Maps SDK is loaded: ask for GPS, reverse-geocode it,
+  // populate the address field, and route from there. Tracked with a ref so
+  // we don't re-run if isLoaded toggles.
+  const didAutofillGpsRef = useRef(false);
   useEffect(() => {
-    if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(async (pos) => {
-      const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-      setResolvedAddress("Current location");
-      reverseGeocodeToField(loc);
-      await fetchHospitalsByCoords(loc.lat, loc.lng);
-      await requestRecommendations(loc);
-    });
+    if (!isLoaded || didAutofillGpsRef.current) return;
+    if (!navigator.geolocation || !window.google?.maps?.Geocoder) return;
+    didAutofillGpsRef.current = true;
+
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        const formatted = await reverseGeocode(loc);
+        const display = formatted ?? `${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}`;
+        setLocationAddress(display);
+        setResolvedAddress(display);
+        await fetchHospitalsByCoords(loc.lat, loc.lng);
+        await requestRecommendations(loc);
+      },
+      (err) => {
+        console.warn("Geolocation failed:", err);
+        setLocationError(`Couldn't get current location: ${err.message}`);
+      },
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 60_000 },
+    );
   }, [isLoaded]);
 
-  function reverseGeocodeToField(loc) {
-    if (!isLoaded || !window.google?.maps?.Geocoder) return;
-    const geocoder = new window.google.maps.Geocoder();
-    geocoder.geocode({ location: loc }, (results, status) => {
-      if (status === "OK" && results?.[0]) {
-        const formatted = results[0].formatted_address;
-        setLocationAddress(formatted);
-        setResolvedAddress(formatted);
-      }
+  function reverseGeocode(loc) {
+    return new Promise((resolve) => {
+      const geocoder = new window.google.maps.Geocoder();
+      geocoder.geocode({ location: loc }, (results, status) => {
+        if (status === "OK" && results?.[0]) {
+          resolve(results[0].formatted_address);
+        } else {
+          console.warn("Reverse geocode failed:", status);
+          resolve(null);
+        }
+      });
     });
   }
 
@@ -630,6 +640,7 @@ function App() {
                       <input
                         ref={addressInputRef}
                         type="text"
+                        value={locationAddress}
                         onChange={(e) => setLocationAddress(e.target.value)}
                         className="w-full rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
                         placeholder="Start typing an address"
