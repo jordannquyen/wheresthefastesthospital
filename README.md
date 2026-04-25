@@ -1,24 +1,22 @@
 # Vital-Route LA Demo
 
-Vital-Route is a Los Angeles healthcare network routing demo that treats patients as packets and hospitals as nodes. The app visualizes congestion and ranks the top 3 hospital choices by distance first, then available capacity.
+Vital-Route is a healthcare network routing demo that treats patients as packets and hospitals as nodes. The app visualizes congestion and ranks the top 3 hospital choices by distance first, then available capacity.
 
 ## What this demo includes
 
-- LA node inventory in JSON ([server/nodes.json](server/nodes.json)).
-- Backend telemetry simulator that updates every 10 seconds.
-- Address-based location input (example: "200 N Spring St, Los Angeles") that geocodes to coordinates.
-- Address autocomplete using Google Places so users can pick addresses without typing full strings.
-- Optional specification filter:
-	- STEMI -> routes to STEMI-capable centers
-	- Stroke -> routes to stroke-capable centers
-	- Trauma -> routes to trauma-capable centers
+- Real-time hospital data from HHS Socrata API (no auth required)
+- Global map view initially, then fetches hospitals within 50 miles of entered address
+- Address-based location input (example: "200 N Spring St, Los Angeles") that geocodes to coordinates
+- Address autocomplete using Google Places so users can pick addresses without typing full strings
+- Real bed capacity and utilization data from HHS hospitals dataset (last reported occupancy)
 - Top-3 hospital ranking logic:
 	- primary: shortest distance
 	- secondary tie-breaker: higher available beds
+	- tertiary: lower estimated wait time based on utilization
 
-- Google Distance Matrix integration for real-time traffic-aware travel metrics.
+- Google Distance Matrix integration for real-time traffic-aware travel metrics
 - Frontend dashboard with:
-	- glowing utilization circles (green, yellow, red pulse)
+	- glowing utilization circles (green, yellow, red pulse) based on real bed data
 	- address or click-to-route for patient origin points
 	- grey dashed line for closest-hospital baseline
 	- bright blue line for top recommendation
@@ -27,21 +25,24 @@ Vital-Route is a Los Angeles healthcare network routing demo that treats patient
 ## Architecture
 
 - Frontend: React + Tailwind + Google Maps JavaScript API
-- Backend: Express (Node.js) + telemetry simulator + Distance Matrix client
+- Backend: Express (Node.js) + Socrata API client + Distance Matrix client
 - Data model:
-	- [server/nodes.json](server/nodes.json): static topology
-	- [server/telemetry.js](server/telemetry.js): dynamic controller state
-	- [server/index.js](server/index.js): API and cost function
+	- Real-time hospitals fetched from HHS Socrata API https://healthdata.gov/resource/anag-cw7u.json
+	- Hospitals within 50-mile radius sorted by distance from input location
+	- [server/index.js](server/index.js): API endpoints and routing logic
 
 ## API endpoints
 
 - GET /api/health
-- GET /api/nodes
-- GET /api/telemetry
+- GET /api/nodes (returns empty initially, expects city/state query params)
+- POST /api/hospitals-by-coords
+	- body: { "lat": 34.0522, "lng": -118.2437 }
+	- Returns hospitals within 50 miles sorted by distance
+- GET /api/telemetry (returns empty initially)
 - POST /api/geocode
-  - body: { "address": "200 N Spring St, Los Angeles" }
+	- body: { "address": "200 N Spring St, Los Angeles" }
 - POST /api/route
-	- body: { "origin": { "lat": 34.02, "lng": -118.49 }, "specification": "stemi|stroke|trauma" }
+	- body: { "origin": { "lat": 34.02, "lng": -118.49 }, "specification": "stemi|stroke|trauma" (optional) }
 
 ## Setup
 

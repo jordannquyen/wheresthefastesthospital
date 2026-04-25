@@ -2,48 +2,87 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project
+## Project Overview
 
-**WTF — Where's The Fastest Hospital** is a healthcare routing demo. It ranks nearby LA hospitals by distance, real-time capacity, and optional filters (clinical specialty, insurance), then visualizes results on an interactive Google Map.
+**Vital-Route** is a healthcare network routing demo for the LA area. It treats patients as packets and hospitals as nodes, then ranks the top 3 hospital options by: (1) shortest travel distance, (2) higher available beds as tie-breaker, (3) lower estimated wait time. Live hospital utilization data comes from the HHS Socrata API; traffic-aware travel times come from Google Distance Matrix.
 
 ## Commands
 
 ```bash
-npm install          # Install all dependencies (required before first run)
-npm run dev          # Run frontend (Vite, port 5173) + backend (Express, port 8787) concurrently
-npm run dev:client   # Frontend only
-npm run dev:server   # Backend only (node --watch)
-npm run build        # Production build
+npm install          # install dependencies
+npm run dev          # run frontend (Vite) + backend (Express) concurrently
+npm run dev:client   # Vite only (port 5173)
+npm run dev:server   # Express only (port 8787, with --watch)
+npm run build        # production build of frontend
 npm run lint         # ESLint
+npm run preview      # preview production build
+npm start            # production Express server only
 ```
 
-## Environment
-
-Requires a `.env` file at the project root:
-
-```
-GOOGLE_MAPS_API_KEY=your_key_here
-PORT=8787
-```
-
-The app degrades gracefully without a key: the map won't load, geocoding fails, and the backend falls back to haversine distance estimation instead of Google Distance Matrix.
+**Required before running:** create a `.env` file with `GOOGLE_MAPS_API_KEY=<key>`. Without it, the app runs in fallback mode (haversine estimates instead of Distance Matrix; geocoding and Places Autocomplete disabled).
 
 ## Architecture
 
-**Frontend** (`src/`) — React 18 + Vite + Tailwind CSS (Space Grotesk / IBM Plex Mono fonts). Single component in `App.jsx` manages all state. Vite proxies `/api/*` to `localhost:8787` in development.
+The app is a single-page React frontend talking to an Express backend via a Vite dev proxy (`/api/*` → `localhost:8787`).
 
-**Backend** (`server/`) — Express on port 8787.
-- `nodes.json` — static list of 8 LA hospitals (location, specialty, accepted insurance)
-- `telemetry.js` — in-memory simulation of hospital metrics (utilization, wait times, beds); jitters every 10 seconds
-- `index.js` — REST API: `/api/nodes`, `/api/telemetry`, `/api/geocode`, `/api/route`, `/api/health`
+### Backend (`server/index.js`)
 
-**Routing algorithm** (`POST /api/route`): ranks hospitals by distance (ascending) → available capacity (descending) → wait time. Accepts optional `spec` (STEMI/Stroke/Trauma) and `insurance` filters. Uses Google Distance Matrix API if key is present, otherwise haversine.
+All routing logic lives here. Key functions:
 
-**Real-time loop**: Frontend polls `/api/telemetry` every 10 seconds. Markers pulse red when utilization ≥ 90%.
+- `fetchHospitalsByDistance(lat, lng, radiusMiles)` — queries HHS Socrata API for CA hospitals, filters by haversine distance, returns sorted list
+- `getTravelMetrics(origin, nodes)` — calls Google Distance Matrix for real travel times; falls back to haversine if no API key
+- `computeRoute(origin, specification, insurance)` — main pipeline: fetch hospitals → get travel metrics → score and rank → apply specialty/insurance filters → return top 3
 
-## Key Frontend Behaviors
+API endpoints (all prefixed `/api/`):
 
-- Clicking the map immediately triggers routing from that point (no geocode needed)
-- Address search uses Google Places Autocomplete, then POSTs to `/api/geocode`
-- Map polylines: grey dashed = closest by distance only, bright blue = recommended, cyan = alternatives
-- Marker color: green < 50% utilization, yellow 50–89%, pulsing red ≥ 90%
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/health` | Provider status (`google` or `fallback`) |
+| POST | `/geocode` | Address → `{ lat, lng }` via Google Geocoding |
+| POST | `/hospitals-by-coords` | Hospitals within 50 mi of `{ lat, lng }` |
+| POST | `/route` | Full recommendation: `{ origin, specification?, insurance? }` → top 3 |
+| GET | `/telemetry` | Live utilization snapshot (polled every 10s by frontend) |
+| GET | `/hospitals` | Raw hospital list by city/state |
+| GET | `/nodes` | Alias for `/hospitals` |
+
+Hospital cache TTL is 1 hour to limit Socrata API calls.
+
+### Frontend (`src/App.jsx`)
+
+Single large component managing all state. Key flows:
+
+1. **Address input** → `handleLocationSubmit()` → geocode → fetch hospitals by coords → request route recommendations
+2. **Map click** → `handleMapClick()` → skip geocode, use clicked `{ lat, lng }` → same fetch/route flow
+3. **Places Autocomplete** → `handlePlaceChanged()` → same flow as address input
+4. **Telemetry polling** → `fetchTelemetry()` runs every 10 seconds via `setInterval`
+
+Map rendering uses `@react-google-maps/api`. Hospitals are rendered as colored `Circle` overlays (green < 50% utilization, yellow 50–89%, red ≥ 90%, pulsing above 90%) with `Polyline` routes (dashed grey = closest baseline, solid cyan = recommended, lighter cyan = alternatives 2 & 3).
+
+### Data model
+
+A hospital node returned from `/api/route` looks like:
+```js
+{
+  id, name, lat, lng, address, city, state, zip,
+  distance, durationMins, distanceMiles,
+  beds: { inpatient_total, inpatient_used, inpatient_utilization, icu_total, icu_used, icu_utilization },
+  utilization, waitMins, availableBeds
+}
+```
+
+## Environment & Configuration
+
+| File | Purpose |
+|------|---------|
+| `.env` | `GOOGLE_MAPS_API_KEY` (required for full functionality) |
+| `vite.config.js` | React plugin, `/api` proxy to `:8787`, exposes `VITE_` and `GOOGLE_` env vars to frontend |
+| `tailwind.config.js` | Extends fonts: Space Grotesk (display), IBM Plex Mono (mono) |
+| `eslint.config.js` | Lints `src/` only; `server/` and `dist/` are excluded |
+
+## Fallback Mode
+
+When `GOOGLE_MAPS_API_KEY` is missing:
+- Backend uses haversine distance (no real traffic data); `provider` field returns `"fallback"`
+- Frontend disables the address input and Places Autocomplete, shows a warning
+- Map click still works for setting origin
+- All routing and telemetry still function with estimated distances
