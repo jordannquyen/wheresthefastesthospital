@@ -1,10 +1,13 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { randomUUID } from "node:crypto";
 import { Client } from "@googlemaps/google-maps-services-js";
 import { getNodes, getTelemetry, jitterTelemetry } from "./telemetry.js";
 
 dotenv.config();
+
+const requests = {};
 
 const app = express();
 const googleMapsClient = new Client({});
@@ -80,6 +83,55 @@ app.post("/api/route", async (req, res) => {
   }
 });
 
+app.post("/api/requests", (req, res) => {
+  const { hospitalId, hospitalName, patientSpec, insurance, etaMins } = req.body ?? {};
+  const knownIds = getNodes().map((n) => n.id);
+  if (!hospitalId || !knownIds.includes(hospitalId)) {
+    return res.status(400).json({ error: "valid hospitalId is required" });
+  }
+
+  const autoApproved = shouldAutoApprove(hospitalId);
+  const requestId = randomUUID();
+  requests[requestId] = {
+    requestId,
+    hospitalId,
+    hospitalName: hospitalName ?? hospitalId,
+    patientSpec: patientSpec ?? null,
+    insurance: insurance ?? null,
+    etaMins: etaMins ?? null,
+    status: autoApproved ? "accepted" : "pending",
+    autoApproved,
+    requestedAt: new Date().toISOString(),
+  };
+
+  return res.json({ requestId, status: requests[requestId].status, autoApproved });
+});
+
+app.get("/api/requests", (req, res) => {
+  const { hospitalId } = req.query;
+  let list = Object.values(requests);
+  if (hospitalId) {
+    list = list.filter((r) => r.hospitalId === hospitalId);
+  }
+  list.sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
+  res.json({ requests: list });
+});
+
+app.patch("/api/requests/:requestId", (req, res) => {
+  const { requestId } = req.params;
+  const { status } = req.body ?? {};
+  const record = requests[requestId];
+
+  if (!record) return res.status(404).json({ error: "request not found" });
+  if (record.status !== "pending") return res.status(409).json({ error: "request already resolved" });
+  if (status !== "accepted" && status !== "diverted") {
+    return res.status(400).json({ error: "status must be accepted or diverted" });
+  }
+
+  record.status = status;
+  return res.json({ ok: true, requestId, status });
+});
+
 setInterval(() => {
   jitterTelemetry();
 }, 10_000);
@@ -99,6 +151,7 @@ async function computeRoute(origin, specification, insurance) {
   const scored = nodes.map((node, index) => {
     const state = telemetry[node.id];
     const traffic = trafficResults[index];
+    const status = deriveStatus(state.utilization);
 
     return {
       ...node,
@@ -107,18 +160,16 @@ async function computeRoute(origin, specification, insurance) {
       availableBeds: state.availableBeds,
       distanceMiles: traffic.distanceMiles,
       durationMins: traffic.durationMins,
+      status,
     };
   });
 
-  const ranked = [...scored].sort((a, b) => {
-    if (a.distanceMiles !== b.distanceMiles) {
-      return a.distanceMiles - b.distanceMiles;
-    }
-    if (a.availableBeds !== b.availableBeds) {
-      return b.availableBeds - a.availableBeds;
-    }
-    return a.waitMins - b.waitMins;
-  });
+  const ranked = [...scored]
+    .map((node) => ({
+      ...node,
+      score: scoreHospital(node, normalizedSpecification),
+    }))
+    .sort((a, b) => b.score - a.score);
 
   // Filter by clinical specification if provided
   let candidates = normalizedSpecification
@@ -144,7 +195,7 @@ async function computeRoute(origin, specification, insurance) {
     specificationMatchFound: candidates.length > 0 || !normalizedSpecification,
     insurance: normalizedInsurance,
     insuranceMatchFound: !normalizedInsurance || candidates.some((node) => (node.acceptedInsurance ?? []).includes(normalizedInsurance)),
-    model: "rank by distanceMiles asc, then availableBeds desc",
+    model: "score = specialty × status × availableBeds / (ETA + waitMins)",
     closest,
     recommended,
     top3,
@@ -220,6 +271,30 @@ async function getTravelMetrics(origin, nodes) {
       durationMins,
     };
   });
+}
+
+function shouldAutoApprove(hospitalId) {
+  const state = getTelemetry().nodes[hospitalId];
+  if (!state) return false;
+  return deriveStatus(state.utilization) === "Open"
+    && state.availableBeds >= 5
+    && state.waitMins <= 60;
+}
+
+function deriveStatus(utilization) {
+  if (utilization >= 0.95) return "Diversion";
+  if (utilization >= 0.80) return "Saturation";
+  return "Open";
+}
+
+function scoreHospital(node, spec) {
+  const STATUS_MULTIPLIER = { Open: 1.0, Saturation: 0.5, Diversion: 0 };
+  const timeToTreatment = (node.durationMins + node.waitMins) || 1;
+  const specialty = spec
+    ? (node.centerTypes ?? []).includes(spec) ? 3.0 : 0.5
+    : 1.0;
+  const status = STATUS_MULTIPLIER[node.status] ?? 1.0;
+  return specialty * status * node.availableBeds / timeToTreatment;
 }
 
 function haversineMiles(lat1, lon1, lat2, lon2) {
