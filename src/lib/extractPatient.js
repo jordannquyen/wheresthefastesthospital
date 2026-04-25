@@ -128,6 +128,7 @@ export function extractPatient(rawTranscript) {
     age: extractAge(transcript),
     sex: extractSex(transcript),
     condition,
+    mechanismOfInjury: extractMechanism(lower),
     severity: inferSeverity(vitals, lower),
     insuranceProvider: pickByLastOccurrence(lower, INSURANCE_KEYWORDS),
     address: extractLocation(transcript)?.phrase ?? null,

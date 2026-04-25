@@ -254,6 +254,10 @@ function mapSocrataBeds(h) {
 const npiCache = new Map();
 const NPI_CACHE_TTL = 86_400_000; // 24h — NPI data changes rarely
 
+// HIFLD trauma designation + CMS stroke/cardiac capability — refreshed every 24h
+const SPECIALTY_CACHE_TTL = 86_400_000;
+let specialtyCache = { traumaByName: new Map(), strokeByCCN: new Set(), cardiacByCCN: new Set(), ts: 0 };
+
 async function fetchNpiData(hospitalName, city, state) {
   try {
     const url = new URL("https://npiregistry.cms.hhs.gov/api/");
@@ -284,6 +288,168 @@ async function fetchAndCacheNpi(h) {
   if (cached && Date.now() - cached.ts < NPI_CACHE_TTL) return;
   const npiResult = await fetchNpiData(h.hospital_name, h.city, h.state);
   npiCache.set(h.hospital_pk, { npiResult, ts: Date.now() });
+}
+
+// --- Specialty data (HIFLD trauma levels + CMS stroke/cardiac capability) ---
+
+// Name-pattern fallback — used when external APIs are unavailable.
+// Patterns match against the raw UPPERCASE hospital_name from HHS Protect.
+// Sources: CA EMSA trauma list, Joint Commission stroke certifications (public).
+const SPECIALTY_NAME_PATTERNS = [
+  { re: /CEDARS.SINAI/,                                           traumaLevel: "I",   stroke: true,  cardiac: true  },
+  { re: /RONALD\s*REAGAN\s*UCLA|UCLA\s*MEDICAL\s*CENTER/,         traumaLevel: "I",   stroke: true,  cardiac: true  },
+  { re: /LAC\s*\+?\s*USC|LOS\s+ANGELES\s+COUNTY.*USC/,           traumaLevel: "I",   stroke: true,  cardiac: true  },
+  { re: /HARBOR.{0,4}UCLA/,                                       traumaLevel: "I",   stroke: true,  cardiac: true  },
+  { re: /LOMA\s+LINDA\s+UNIVERSITY/,                              traumaLevel: "I",   stroke: true,  cardiac: true  },
+  { re: /CHILDRENS\s+HOSPITAL\s+LOS\s+ANGELES/,                   traumaLevel: "I",   stroke: false, cardiac: false },
+  { re: /HUNTINGTON\s+HOSPITAL/,                                  traumaLevel: "II",  stroke: true,  cardiac: true  },
+  { re: /NORTHRIDGE\s+HOSPITAL/,                                  traumaLevel: "II",  stroke: true,  cardiac: true  },
+  { re: /PROVIDENCE\s+SAINT\s+JOHN/,                              traumaLevel: "II",  stroke: true,  cardiac: true  },
+  { re: /USC\s+KECK|KECK\s+HOSPITAL/,                             traumaLevel: "II",  stroke: true,  cardiac: true  },
+  { re: /CALIFORNIA\s+HOSPITAL\s+MEDICAL/,                        traumaLevel: "II",  stroke: true,  cardiac: true  },
+  { re: /HENRY\s+MAYO|ANTELOPE\s+VALLEY\s+HOSPITAL/,              traumaLevel: "III", stroke: true,  cardiac: false },
+  // Stroke + cardiac without formal trauma designation
+  { re: /KAISER/,                                                 traumaLevel: null,  stroke: true,  cardiac: true  },
+  { re: /SCRIPPS\s+MERCY|UCSD\s+MEDICAL|UC\s+SAN\s+DIEGO/,       traumaLevel: "I",   stroke: true,  cardiac: true  },
+];
+
+function inferSpecialtyFromName(hospitalName) {
+  const name = (hospitalName ?? "").toUpperCase();
+  for (const p of SPECIALTY_NAME_PATTERNS) {
+    if (p.re.test(name)) return { traumaLevel: p.traumaLevel, strokeCapable: p.stroke, cardiacCapable: p.cardiac };
+  }
+  return null;
+}
+
+function parseTraumaLevel(raw) {
+  if (!raw) return null;
+  const s = String(raw).toUpperCase().replace(/\s+/g, "");
+  const map = { LEVELI: "I", LEVEL1: "I", LEVELII: "II", LEVEL2: "II", LEVELIII: "III", LEVEL3: "III", LEVELIV: "IV", LEVEL4: "IV", LEVELV: "V", LEVEL5: "V" };
+  return map[s] ?? (["I", "II", "III", "IV", "V"].includes(s) ? s : null);
+}
+
+function normalizeName(name) {
+  return (name ?? "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+// HIFLD Hospitals layer — has TRAUMA field (YES/NO) and TRAUMA_LEVEL
+// Falls back to secondary URL if primary returns an error response.
+async function fetchHIFLDTrauma() {
+  const urls = [
+    "https://services1.arcgis.com/Hp6G80Pky0om7QvQ/arcgis/rest/services/Hospitals_1/FeatureServer/0/query",
+    "https://services1.arcgis.com/Hp6G80Pky0om7QvQ/ArcGIS/rest/services/Hospitals_1/FeatureServer/0/query",
+  ];
+
+  let json = null;
+  for (const base of urls) {
+    try {
+      const url = new URL(base);
+      url.searchParams.set("where", "TRAUMA = 'YES'");
+      url.searchParams.set("outFields", "NAME,CITY,STATE,ZIP,TRAUMA,TRAUMA_LEVEL,OBJECTID");
+      url.searchParams.set("resultRecordCount", "3000");
+      url.searchParams.set("f", "json");
+      const res = await fetch(url.toString(), { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue;
+      const candidate = await res.json();
+      if (candidate.features?.length > 0) { json = candidate; break; }
+    } catch { /* try next */ }
+  }
+  if (!json) throw new Error("HIFLD: no working URL or empty response");
+
+  const byName = new Map();
+  for (const feature of json.features ?? []) {
+    const a = feature.attributes ?? {};
+    // HIFLD TRAUMA_LEVEL values: "Level I", "Level II", etc.
+    const level = parseTraumaLevel(a.TRAUMA_LEVEL ?? (a.TRAUMA === "YES" ? "III" : null));
+    if (!level) continue;
+    const key = normalizeName(a.NAME ?? "");
+    if (key.length > 3) byName.set(key, level);
+  }
+  console.log(`HIFLD: loaded ${byName.size} trauma-designated hospitals`);
+  return byName;
+}
+
+// CMS Timely and Effective Care — filter by _condition field (confirmed field name).
+// Uses literal bracket query params (unencoded) which the DKAN API accepts.
+async function fetchCMSCondition(conditionValue) {
+  // Build URL manually to avoid URL.searchParams double-encoding the brackets
+  const base = "https://data.cms.gov/provider-data/api/1/datastore/query/yv7e-xc69/0";
+  const qs = `filters[_condition]=${encodeURIComponent(conditionValue)}&limit=50000`;
+  const res = await fetch(`${base}?${qs}`, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`CMS ${conditionValue} returned ${res.status}`);
+  const text = await res.text();
+  if (text.includes("Technical Difficulties") || text.includes("Temporarily Unavailable")) {
+    throw new Error(`CMS ${conditionValue}: server temporarily unavailable`);
+  }
+  const json = JSON.parse(text);
+  const byCCN = new Set();
+  for (const row of json.results ?? []) {
+    const id = row.facility_id ?? row.provider_id ?? null;
+    if (id) byCCN.add(String(id));
+  }
+  console.log(`CMS ${conditionValue}: loaded ${byCCN.size} facilities`);
+  return byCCN;
+}
+
+async function fetchSpecialtyData() {
+  if (Date.now() - specialtyCache.ts < SPECIALTY_CACHE_TTL) return specialtyCache;
+  try {
+    const [hifldResult, strokeResult, cardiacResult] = await Promise.allSettled([
+      fetchHIFLDTrauma(),
+      fetchCMSCondition("Stroke"),
+      fetchCMSCondition("Heart Attack and Chest Pain"),
+    ]);
+    const traumaByName   = hifldResult.status   === "fulfilled" ? hifldResult.value   : specialtyCache.traumaByName;
+    const strokeByCCN    = strokeResult.status   === "fulfilled" ? strokeResult.value   : specialtyCache.strokeByCCN;
+    const cardiacByCCN   = cardiacResult.status  === "fulfilled" ? cardiacResult.value  : specialtyCache.cardiacByCCN;
+    if (hifldResult.status  === "rejected") console.warn("HIFLD fetch failed:", hifldResult.reason?.message);
+    if (strokeResult.status === "rejected") console.warn("CMS stroke fetch failed:", strokeResult.reason?.message);
+    if (cardiacResult.status === "rejected") console.warn("CMS cardiac fetch failed:", cardiacResult.reason?.message);
+    const usingFallback = strokeByCCN.size === 0 && cardiacByCCN.size === 0 && traumaByName.size === 0;
+    if (usingFallback) console.warn("Specialty APIs unavailable — name-pattern fallback active for all hospitals");
+    else console.log(`Specialty cache: trauma=${traumaByName.size} names, stroke=${strokeByCCN.size}, cardiac=${cardiacByCCN.size}`);
+    specialtyCache = { traumaByName, strokeByCCN, cardiacByCCN, ts: Date.now() };
+  } catch (err) {
+    console.warn("fetchSpecialtyData error:", err.message);
+  }
+  return specialtyCache;
+}
+
+function enrichSpecialty(h, specialty) {
+  const ccn = String(h.ccn ?? "");
+  const nameKey = normalizeName(h.hospital_name ?? "");
+
+  // API data takes precedence; name-pattern heuristic fills gaps
+  const apiTrauma = specialty.traumaByName?.get(nameKey) ?? null;
+  const apiStroke = specialty.strokeByCCN?.has(ccn) ?? false;
+  const apiCardiac = specialty.cardiacByCCN?.has(ccn) ?? false;
+
+  // Apply name-pattern fallback for any field not resolved by API data
+  const fromName = (!apiTrauma && !apiStroke && !apiCardiac)
+    ? (inferSpecialtyFromName(h.hospital_name) ?? {})
+    : {};
+
+  return {
+    traumaLevel:   apiTrauma  ?? fromName.traumaLevel  ?? null,
+    strokeCapable: apiStroke  || (fromName.strokeCapable  ?? false),
+    cardiacCapable: apiCardiac || (fromName.cardiacCapable ?? false),
+  };
+}
+
+function getSpecialtyMultiplier(node, condition) {
+  if (!condition) return 1.0;
+  if (condition === "trauma") {
+    const level = node.traumaLevel;
+    if (level === "I") return 3.0;
+    if (level === "II") return 2.0;
+    if (level === "III") return 1.5;
+    if (level === "IV") return 1.0;
+    if (level === "V") return 0.8;
+    return 0.5;
+  }
+  if (condition === "stroke") return node.strokeCapable ? 3.0 : 0.5;
+  if (condition === "cardiac") return node.cardiacCapable ? 3.0 : 0.5;
+  return 1.0;
 }
 
 // Infer accepted insurances from CMS certification number, hospital subtype, and NPI taxonomy codes.
@@ -329,8 +495,12 @@ async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
       return haversineMiles(lat, lng, coords[1], coords[0]) <= radiusMiles;
     });
 
-    // Fetch NPI data for any hospitals not yet in cache (parallel, best-effort)
-    await Promise.allSettled(inRange.map((h) => fetchAndCacheNpi(h)));
+    // Fetch NPI + specialty data in parallel (best-effort)
+    await Promise.allSettled([
+      ...inRange.map((h) => fetchAndCacheNpi(h)),
+      fetchSpecialtyData(),
+    ]);
+    const specialty = specialtyCache;
 
     const result = inRange
       .map((h) => {
@@ -347,10 +517,12 @@ async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
           city: h.city,
           state: h.state,
           zip: h.zip,
+          ccn: h.ccn ?? null,
           distance: Number(haversineMiles(lat, lng, hospitalLat, hospitalLng).toFixed(2)),
           beds: mapSocrataBeds(h),
           acceptedInsurance: inferInsurance(h),
           collectionDate: h.collection_week,
+          ...enrichSpecialty(h, specialty),
         };
       })
       .sort((a, b) => a.distance - b.distance);
@@ -391,7 +563,11 @@ async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit 
       raw.filter((h) => h.geocoded_hospital_address && mapSocrataBeds(h).inpatient_total > 0)
     );
 
-    await Promise.allSettled(valid.map((h) => fetchAndCacheNpi(h)));
+    await Promise.allSettled([
+      ...valid.map((h) => fetchAndCacheNpi(h)),
+      fetchSpecialtyData(),
+    ]);
+    const specialty = specialtyCache;
 
     cachedHospitals = valid.map((h) => {
       const coords = h.geocoded_hospital_address.coordinates;
@@ -405,9 +581,11 @@ async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit 
         city: h.city,
         state: h.state,
         zip: h.zip,
+        ccn: h.ccn ?? null,
         beds: mapSocrataBeds(h),
         acceptedInsurance: inferInsurance(h),
         collectionDate: h.collection_week,
+        ...enrichSpecialty(h, specialty),
       };
     });
 
@@ -629,8 +807,8 @@ Schema (use null for any field not mentioned):
 }
 
 Field rules:
-- condition: simple broad category such as "cardiac", "stroke", "trauma", "respiratory", or "unknown"
-- severity: use "critical" for unstable vitals/life threat, "high" for serious, "moderate" for concerning but stable, "low" for minor
+- condition: use "trauma" for high-mechanism injuries (GSW, stab wound, MVC, fall >6ft, ejection, penetrating injury, crush, blast, blunt force head/chest/abdomen); use "cardiac" for STEMI/heart attack/cardiac arrest/chest pain with radiation; use "stroke" for facial droop, slurred speech, one-sided weakness, sudden headache, CVA, last-known-well language; use "respiratory" for respiratory distress/failure; use null for minor complaints (ankle sprain, minor laceration, headache) or when unclear
+- severity: use "critical" for unstable vitals/life threat/unresponsive, "high" for serious mechanism or abnormal vitals, "moderate" for concerning but stable, "low" for minor
 - bloodPressure: "systolic/diastolic" string e.g. "120/80"
 - address: geocodable address or landmark where the patient is
 - chiefComplaint: primary presenting problem in plain language (NOT insurance, NOT demographics)
@@ -1010,12 +1188,12 @@ app.post("/api/geocode", authRequired, async (req, res) => {
 });
 
 app.post("/api/route", authRequired, async (req, res) => {
-  const { origin, insurance } = req.body ?? {};
+  const { origin, condition, insurance } = req.body ?? {};
   if (!origin || typeof origin.lat !== "number" || typeof origin.lng !== "number") {
     return res.status(400).json({ error: "origin.lat and origin.lng are required numeric fields" });
   }
   try {
-    const routeResult = await computeRoute(origin, insurance);
+    const routeResult = await computeRoute(origin, condition ?? null, insurance);
     res.json(routeResult);
   } catch (error) {
     console.error("Routing error", error);
@@ -1263,6 +1441,23 @@ app.get("/api/admin/overrides", authRequired, requireRole("admin"), (_req, res) 
   return res.json({ overrides: hospitalOverrides });
 });
 
+app.get("/api/debug/specialty", (_req, res) => {
+  const age = specialtyCache.ts ? Math.round((Date.now() - specialtyCache.ts) / 1000) : null;
+  const sampleTrauma = [...(specialtyCache.traumaByName?.entries() ?? [])].slice(0, 5).map(([k, v]) => `${k}→${v}`);
+  const sampleStroke = [...(specialtyCache.strokeByCCN?.values() ?? [])].slice(0, 5);
+  const sampleCardiac = [...(specialtyCache.cardiacByCCN?.values() ?? [])].slice(0, 5);
+  res.json({
+    cacheAgeSeconds: age,
+    traumaCount: specialtyCache.traumaByName?.size ?? 0,
+    strokeCount: specialtyCache.strokeByCCN?.size ?? 0,
+    cardiacCount: specialtyCache.cardiacByCCN?.size ?? 0,
+    usingNameFallback: (specialtyCache.strokeByCCN?.size ?? 0) === 0,
+    sampleTrauma,
+    sampleStroke,
+    sampleCardiac,
+  });
+});
+
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error("Unhandled route error:", err);
@@ -1273,6 +1468,7 @@ initializeMongo()
   .then(() => {
     app.listen(port, () => {
       console.log(`Vital-Route backend listening on http://localhost:${port}`);
+      fetchSpecialtyData().catch((err) => console.warn("Specialty pre-warm failed:", err.message));
     });
   })
   .catch((error) => {
@@ -1282,7 +1478,7 @@ initializeMongo()
 
 // --- Routing pipeline ---
 
-async function computeRoute(origin, insurance) {
+async function computeRoute(origin, condition, insurance) {
   const allNodes = await fetchHospitalsByDistance(origin.lat, origin.lng, 50);
   const normalizedInsurance = normalizeInsurance(insurance);
   const nodes = allNodes.slice(0, 25);
@@ -1306,7 +1502,7 @@ async function computeRoute(origin, insurance) {
     };
   });
 
-  const ranked = [...scored].sort((a, b) => scoreHospital(b) - scoreHospital(a));
+  const ranked = [...scored].sort((a, b) => scoreHospital(b, condition) - scoreHospital(a, condition));
 
   let candidates = ranked;
   const insurancePool = normalizedInsurance
@@ -1322,9 +1518,10 @@ async function computeRoute(origin, insurance) {
 
   return {
     origin,
+    condition: condition ?? null,
     insurance: normalizedInsurance,
     insuranceMatchFound,
-    model: "cost = ETA + waitMins + statusPenalty(Open=0,Sat=0,Div=3)",
+    model: "cost = (ETA + waitMins + statusPenalty) / specialtyMultiplier",
     closest,
     recommended,
     top3,
@@ -1404,15 +1601,15 @@ function deriveStatus(utilization) {
   return "Open";
 }
 
-function scoreHospital(node) {
-  // Lower cost = better. Total time (ETA + waitMins) is primary;
-  // status adds a flat minute-equivalent penalty so red hospitals lose to
-  // equivalently-close green ones but aren't excluded entirely.
+function scoreHospital(node, condition) {
+  // Lower time cost = better. Specialty multiplier divides effective cost so a
+  // matched Level I trauma center or stroke-capable hospital appears "closer".
   const STATUS_PENALTY = { Open: 0, Saturation: 0, Diversion: 3 };
   const eta = node.durationMins || 1;
   const waitMins = node.waitMins || 0;
   const penalty = STATUS_PENALTY[node.status] ?? 0;
-  return -(eta + waitMins + penalty);
+  const multiplier = getSpecialtyMultiplier(node, condition);
+  return -(eta + waitMins + penalty) / multiplier;
 }
 
 function normalizeInsurance(input) {
