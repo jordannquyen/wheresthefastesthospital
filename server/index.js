@@ -145,10 +145,7 @@ app.get("/api/health", (_req, res) => {
 
 app.get("/api/nodes", async (req, res) => {
   const { city, state = "CA" } = req.query;
-  if (!city) {
-    res.json({ nodes: [] });
-    return;
-  }
+  if (!city) return res.json({ nodes: [] });
   const hospitals = await fetchAndCacheHospitals(city.toUpperCase(), state);
   res.json({ nodes: hospitals });
 });
@@ -169,10 +166,8 @@ app.post("/api/hospitals-by-coords", async (req, res) => {
 
 app.get("/api/telemetry", async (req, res) => {
   const { city, state = "CA" } = req.query;
-  if (!city) {
-    res.json({ updatedAt: new Date().toISOString(), nodes: {} });
-    return;
-  }
+  if (!city) return res.json({ updatedAt: new Date().toISOString(), nodes: {} });
+
   const hospitals = await fetchAndCacheHospitals(city.toUpperCase(), state);
   const telemetryNodes = Object.fromEntries(
     hospitals.map((h) => [
@@ -215,9 +210,14 @@ app.get("/api/hospitals", async (req, res) => {
           beds: {
             inpatient_total: parseFloat(h.inpatient_beds_7_day_avg) || 0,
             inpatient_used: parseFloat(h.inpatient_beds_used_7_day_avg) || 0,
-            inpatient_utilization: h.inpatient_beds_used_7_day_avg && h.inpatient_beds_7_day_avg
-              ? Math.round((parseFloat(h.inpatient_beds_used_7_day_avg) / parseFloat(h.inpatient_beds_7_day_avg)) * 100)
-              : 0,
+            inpatient_utilization:
+              h.inpatient_beds_used_7_day_avg && h.inpatient_beds_7_day_avg
+                ? Math.round(
+                    (parseFloat(h.inpatient_beds_used_7_day_avg) /
+                      parseFloat(h.inpatient_beds_7_day_avg)) *
+                      100
+                  )
+                : 0,
             icu_total: parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 0,
             icu_used: parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0,
           },
@@ -270,115 +270,48 @@ app.post("/api/route", async (req, res) => {
   }
 });
 
-app.post("/api/dispatch", (req, res) => {
-  const { chain, patientSpec, insurance } = req.body ?? {};
-  if (!Array.isArray(chain) || chain.length === 0) {
-    return res.status(400).json({ error: "chain must be a non-empty array" });
-  }
-
-  const dispatchId = randomUUID();
-  const dispatch = {
-    dispatchId,
-    chain,
-    currentIndex: 0,
-    patientSpec: patientSpec ?? null,
-    insurance: insurance ?? null,
-    activeRequestId: null,
-    status: "active",
-    createdAt: new Date().toISOString(),
-  };
-  dispatches[dispatchId] = dispatch;
-
-  const requestId = createRequest(dispatch, 0, null);
-  dispatch.activeRequestId = requestId;
-
-  return res.json({ dispatchId, requestId, status: requests[requestId].status, autoApproved: requests[requestId].autoApproved });
-});
-
-app.get("/api/dispatch/:dispatchId", (req, res) => {
-  const dispatch = dispatches[req.params.dispatchId];
-  if (!dispatch) return res.status(404).json({ error: "dispatch not found" });
-
-  const activeRequest = requests[dispatch.activeRequestId] ?? null;
-  const chainWithStatus = dispatch.chain.map((entry, index) => {
-    const req = Object.values(requests).find(
-      (r) => r.dispatchId === dispatch.dispatchId && r.chainIndex === index
-    );
-    return { ...entry, requestStatus: req?.status ?? null, requestId: req?.requestId ?? null };
-  });
-
-  return res.json({
-    dispatchId: dispatch.dispatchId,
-    status: dispatch.status,
-    currentIndex: dispatch.currentIndex,
-    currentHospital: dispatch.chain[dispatch.currentIndex] ?? null,
-    activeRequest,
-    chain: chainWithStatus,
-    patientSpec: dispatch.patientSpec,
-    insurance: dispatch.insurance,
-  });
-});
+// --- EMT request endpoints ---
 
 app.get("/api/requests", (req, res) => {
   const { hospitalId } = req.query;
-  let list = Object.values(requests);
-  if (hospitalId) list = list.filter((r) => r.hospitalId === hospitalId);
-  list.sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
-  res.json({ requests: list });
+  let result = Object.values(requests);
+  if (hospitalId) result = result.filter((r) => r.hospitalId === hospitalId);
+  result.sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
+  res.json({ requests: result });
+});
+
+app.post("/api/requests", (req, res) => {
+  const { hospitalId, hospitalName, patientSpec, insurance, etaMins } = req.body ?? {};
+  if (!hospitalId || !hospitalName) {
+    return res.status(400).json({ error: "hospitalId and hospitalName are required" });
+  }
+  const requestId = randomUUID();
+  const autoApproved = shouldAutoApprove(hospitalId);
+  const entry = {
+    requestId,
+    hospitalId,
+    hospitalName,
+    patientSpec: patientSpec || null,
+    insurance: insurance || null,
+    etaMins: etaMins ?? null,
+    status: autoApproved ? "accepted" : "pending",
+    autoApproved,
+    requestedAt: new Date().toISOString(),
+  };
+  requests[requestId] = entry;
+  res.json({ requestId, autoApproved, status: entry.status });
 });
 
 app.patch("/api/requests/:requestId", (req, res) => {
   const { requestId } = req.params;
   const { status } = req.body ?? {};
-  const record = requests[requestId];
-
-  if (!record) return res.status(404).json({ error: "request not found" });
-  if (record.status !== "pending") return res.status(409).json({ error: "request already resolved" });
-  if (status !== "accepted" && status !== "diverted") {
-    return res.status(400).json({ error: "status must be accepted or diverted" });
+  const entry = requests[requestId];
+  if (!entry) return res.status(404).json({ error: "Request not found" });
+  if (!["accepted", "diverted"].includes(status)) {
+    return res.status(400).json({ error: "status must be 'accepted' or 'diverted'" });
   }
-
-  record.status = status;
-
-  const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
-  if (dispatch) {
-    if (status === "accepted") {
-      dispatch.status = "accepted";
-    } else if (status === "diverted") {
-      const nextIndex = dispatch.currentIndex + 1;
-      if (nextIndex < dispatch.chain.length) {
-        dispatch.currentIndex = nextIndex;
-        const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
-        dispatch.activeRequestId = nextRequestId;
-      } else {
-        dispatch.status = "exhausted";
-      }
-    }
-  }
-
-  return res.json({ ok: true, requestId, status, dispatch: dispatch ?? null });
-});
-
-app.post("/api/admin/override", (req, res) => {
-  const { hospitalId, status } = req.body ?? {};
-  if (!["Open", "Saturation", "Diversion"].includes(status)) {
-    return res.status(400).json({ error: "status must be Open, Saturation, or Diversion" });
-  }
-  hospitalOverrides[hospitalId] = status;
-  return res.json({ ok: true, hospitalId, status });
-});
-
-app.delete("/api/admin/override/:hospitalId", (req, res) => {
-  delete hospitalOverrides[req.params.hospitalId];
-  return res.json({ ok: true, hospitalId: req.params.hospitalId });
-});
-
-app.get("/api/admin/overrides", (_req, res) => {
-  const summary = Object.entries(hospitalOverrides).map(([hospitalId, override]) => ({
-    hospitalId,
-    override,
-  }));
-  return res.json({ overrides: hospitalOverrides, hospitals: summary });
+  entry.status = status;
+  res.json({ requestId, status });
 });
 
 app.listen(port, () => {
@@ -410,9 +343,11 @@ async function computeRoute(origin, specification, insurance) {
     };
   });
 
-  const ranked = [...scored]
-    .map((node) => ({ ...node, score: scoreHospital(node, normalizedSpecification) }))
-    .sort((a, b) => b.score - a.score);
+  // Rank using composite score: specialty x status x availableBeds / timeToTreatment
+  const ranked = [...scored].sort(
+    (a, b) =>
+      scoreHospital(b, normalizedSpecification) - scoreHospital(a, normalizedSpecification)
+  );
 
   let candidates = normalizedSpecification
     ? ranked.filter((node) => (node.centerTypes ?? []).includes(normalizedSpecification))
@@ -434,8 +369,12 @@ async function computeRoute(origin, specification, insurance) {
     specification: normalizedSpecification,
     specificationMatchFound: candidates.length > 0 || !normalizedSpecification,
     insurance: normalizedInsurance,
-    insuranceMatchFound: !normalizedInsurance || candidates.some((node) => (node.acceptedInsurance ?? []).includes(normalizedInsurance)),
-    model: "score = specialty × status × availableBeds / (ETA + waitMins)",
+    insuranceMatchFound:
+      !normalizedInsurance ||
+      candidates.some((node) =>
+        (node.acceptedInsurance ?? []).includes(normalizedInsurance)
+      ),
+    model: "score = specialty x status x availableBeds / (ETA + waitMins)",
     closest,
     recommended,
     top3,
@@ -443,6 +382,31 @@ async function computeRoute(origin, specification, insurance) {
     provider: googleMapsApiKey ? "google" : "fallback",
     generatedAt: new Date().toISOString(),
   };
+}
+
+function deriveStatus(utilization) {
+  if (utilization >= 0.95) return "Diversion";
+  if (utilization >= 0.80) return "Saturation";
+  return "Open";
+}
+
+function scoreHospital(node, spec) {
+  const STATUS_MULTIPLIER = { Open: 1.0, Saturation: 0.5, Diversion: 0 };
+  const timeToTreatment = (node.durationMins + node.waitMins) || 1;
+  const specialty = spec
+    ? (node.centerTypes ?? []).includes(spec) ? 3.0 : 0.5
+    : 1.0;
+  const status = STATUS_MULTIPLIER[node.status] ?? 1.0;
+  return (specialty * status * node.availableBeds) / timeToTreatment;
+}
+
+function shouldAutoApprove(hospitalId) {
+  const hospital = cachedHospitals.find((h) => h.id === hospitalId);
+  if (!hospital) return false;
+  const utilization = hospital.beds.inpatient_utilization / 100;
+  const availableBeds = Math.round(hospital.beds.inpatient_total - hospital.beds.inpatient_used);
+  const waitMins = Math.round(10 + hospital.beds.inpatient_utilization * 0.5);
+  return deriveStatus(utilization) === "Open" && availableBeds >= 5 && waitMins <= 60;
 }
 
 function normalizeSpecification(input) {
