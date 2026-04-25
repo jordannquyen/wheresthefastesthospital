@@ -13,7 +13,8 @@ import { extractPatient } from "./lib/extractPatient.js";
 import logo from "./assets/logo_nobkg.png";
 
 const isAdminMode = new URLSearchParams(window.location.search).has("admin");
-const isHospitalPage = window.location.pathname.replace(/\/$/, "") === "/hospital";
+const appPath = window.location.pathname.replace(/\/$/, "") || "/";
+const isHospitalPage = appPath === "/hospital";
 const centerGL = { lat: 34.0522, lng: -118.2437 };
 const defaultZoom = 11;
 const mapContainerStyle = { width: "100%", height: "100%" };
@@ -39,6 +40,74 @@ function buildPickedOverDiff(a, b) {
 }
 
 function App() {
+  if (appPath === "/") return <LandingPage />;
+  return <OperationalApp />;
+}
+
+function LandingPage() {
+  return (
+    <main className="screen bg-grid text-slate-100">
+      <section className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-5 py-5 sm:px-8 lg:px-10">
+        <header className="flex items-center justify-between gap-4">
+          <a href="/" className="flex items-center gap-3">
+            <img src={logo} alt="Vital-Route logo" className="h-10 w-auto" />
+            <span className="text-lg font-bold tracking-tight">wtf-hospital</span>
+          </a>
+          <nav className="flex items-center gap-2">
+            <a href="/emt" className="rounded-md px-3 py-2 text-sm font-semibold text-slate-200 transition hover:bg-slate-800/80">EMT</a>
+            <a href="/hospital" className="rounded-md px-3 py-2 text-sm font-semibold text-slate-200 transition hover:bg-slate-800/80">Hospital</a>
+          </nav>
+        </header>
+
+        <div className="grid flex-1 items-center gap-8 py-10 lg:grid-cols-[1.05fr_0.95fr] lg:py-12">
+          <section>
+            <p className="font-mono text-xs uppercase tracking-[0.24em] text-cyan-300">voice intake to hospital acceptance</p>
+            <h1 className="mt-4 max-w-3xl text-5xl font-bold leading-[1.02] tracking-tight text-white sm:text-6xl lg:text-7xl">
+              Route emergency patients faster.
+            </h1>
+            <p className="mt-5 max-w-2xl text-lg leading-8 text-slate-300">
+              Turn EMT voice reports into structured patient records, rank nearby hospitals by capacity and ETA, and give receiving teams a live incoming-patient queue.
+            </p>
+            <div className="mt-8 flex flex-col gap-3 sm:flex-row">
+              <a href="/emt" className="inline-flex items-center justify-center rounded-md bg-cyan-400 px-5 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition hover:bg-cyan-300">
+                Open EMT Side
+              </a>
+              <a href="/hospital" className="inline-flex items-center justify-center rounded-md border border-slate-500 bg-slate-900/60 px-5 py-3 text-sm font-bold text-slate-100 transition hover:border-cyan-300 hover:bg-slate-800">
+                Open Hospital Side
+              </a>
+            </div>
+          </section>
+
+          <section className="overflow-hidden rounded-xl border border-slate-700 bg-slate-950/70 shadow-2xl shadow-black/40">
+            <div className="border-b border-slate-700 bg-slate-900/80 px-4 py-3">
+              <p className="font-mono text-[11px] uppercase tracking-[0.18em] text-cyan-300">live workflow</p>
+            </div>
+            <div className="grid gap-0 sm:grid-cols-2 lg:grid-cols-1">
+              <img src={logo} alt="Vital-Route" className="mx-auto h-44 w-auto object-contain p-8 sm:h-full lg:h-52" />
+              <div className="border-t border-slate-700 p-5 sm:border-l sm:border-t-0 lg:border-l-0 lg:border-t">
+                <div className="space-y-3 text-sm">
+                  {[
+                    ["1", "EMT voice transcript captured"],
+                    ["2", "AI extracts patient severity and vitals"],
+                    ["3", "MongoDB patient record created"],
+                    ["4", "Hospital accepts from dashboard"],
+                  ].map(([step, label]) => (
+                    <div key={step} className="flex items-center gap-3 rounded-md border border-slate-700 bg-slate-900/70 p-3">
+                      <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-cyan-400/15 font-mono text-xs font-bold text-cyan-300">{step}</span>
+                      <span className="text-slate-200">{label}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function OperationalApp() {
   const [nodes, setNodes] = useState([]);
   const [origin, setOrigin] = useState(null);
   const [route, setRoute] = useState(null);
@@ -580,11 +649,17 @@ function App() {
     <main className="screen bg-grid text-slate-100">
       <section className="mx-auto grid h-full w-full max-w-[1500px] grid-rows-[auto_auto_1fr] gap-4 p-4 lg:p-6">
         <header className="flex items-center gap-4 rounded-xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
-          <img src={logo} alt="Vital-Route logo" className="h-10 w-auto" />
-          <div>
-            <h1 className="text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
-            <p className="mt-1 text-sm text-slate-300">optimize saving lives</p>
-          </div>
+          <a href="/" className="flex items-center gap-4">
+            <img src={logo} alt="Vital-Route logo" className="h-10 w-auto" />
+            <div>
+              <h1 className="text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
+              <p className="mt-1 text-sm text-slate-300">optimize saving lives</p>
+            </div>
+          </a>
+          <nav className="ml-auto hidden items-center gap-2 sm:flex">
+            <a href="/emt" className={`rounded-md px-3 py-2 text-sm font-semibold transition ${!isHospitalPage ? "bg-cyan-500 text-slate-950" : "text-slate-300 hover:bg-slate-800"}`}>EMT</a>
+            <a href="/hospital" className={`rounded-md px-3 py-2 text-sm font-semibold transition ${isHospitalPage ? "bg-cyan-500 text-slate-950" : "text-slate-300 hover:bg-slate-800"}`}>Hospital</a>
+          </nav>
         </header>
 
         {tabs.length > 1 && (
