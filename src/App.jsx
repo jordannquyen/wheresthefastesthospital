@@ -606,6 +606,12 @@ function App() {
                 {patientSummary && (
                   <div className="mt-3 space-y-1.5 rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-200">
                     <p className="font-mono uppercase tracking-wide text-cyan-300">Patient summary</p>
+                    {patientSummary.name && (
+                      <p>Name: <span className="font-semibold text-white">{patientSummary.name}</span></p>
+                    )}
+                    {(patientSummary.age || patientSummary.sex) && (
+                      <p>Demographics: {[patientSummary.age && `${patientSummary.age}y`, patientSummary.sex].filter(Boolean).join(", ")}</p>
+                    )}
                     {patientSummary.specification && (
                       <p>Suspected: <span className="font-semibold text-white">{patientSummary.specification.toUpperCase()}</span></p>
                     )}
@@ -614,9 +620,6 @@ function App() {
                     )}
                     {patientSummary.location?.phrase && (
                       <p>Location heard: <span className="font-semibold text-white">{patientSummary.location.phrase}</span></p>
-                    )}
-                    {(patientSummary.age || patientSummary.sex) && (
-                      <p>Demographics: {[patientSummary.age && `${patientSummary.age}y`, patientSummary.sex].filter(Boolean).join(", ")}</p>
                     )}
                     {(patientSummary.vitals.bp || patientSummary.vitals.hr || patientSummary.vitals.spo2) && (
                       <p>Vitals: {[

@@ -3,15 +3,29 @@
  *
  * Schema returned:
  *   {
- *     specification: "stemi" | "stroke" | "trauma" | null,
- *     insurance: "Medicare" | "Medicaid" | "Blue Cross" | "Aetna"
- *              | "United Healthcare" | "Cigna" | "Kaiser" | null,
- *     location: { phrase: string } | null,   // free-text — geocode upstream
- *     age: number | null,
- *     sex: "male" | "female" | null,
- *     vitals: { bp: string|null, hr: number|null, spo2: number|null },
- *     transcript: string,
+ *     name:           string | null,        // patient name if mentioned
+ *     age:            number | null,
+ *     sex:            "male" | "female" | null,
+ *     specification:  "stemi" | "stroke" | "trauma" | null,
+ *                                           // informational only — passed to
+ *                                           // /api/patients for the receiving
+ *                                           // hospital and shown in the patient
+ *                                           // summary card. NOT a routing
+ *                                           // filter (main went insurance-only).
+ *     insurance:      "Medicare" | "Medicaid" | "Blue Cross" | "Aetna"
+ *                   | "United Healthcare" | "Cigna" | "Kaiser" | null,
+ *                                           // routing filter via POST /api/route
+ *     location:       { phrase: string } | null,
+ *                                           // free-text — geocode upstream
+ *                                           // before posting lat/lng to /api
+ *     vitals:         { bp: string|null, hr: number|null, spo2: number|null },
+ *     transcript:     string,
  *   }
+ *
+ * Fields align with what /api/patients (Mongo persistence) accepts:
+ * `{ name, age, specification, location: { lat, lng }, status }`.
+ * `status` is set by the app, not extracted; `location.lat/lng` come from
+ * geocoding `location.phrase` upstream.
  */
 
 const SPEC_KEYWORDS = {
@@ -81,16 +95,33 @@ const LOCATION_PATTERNS = [
   /\bwe(?:'re|\s+are)\s+(?:at|near)\s+(.+?)(?:[.,;]|\s+(?:with|who)\b|$)/i,
 ];
 
+// Trigger phrases for picking up the patient's name. Capture group is up to
+// 3 word tokens after the trigger; we then require at least one capitalized
+// token (proper-noun signal) and reject obvious non-names like "unconscious".
+const NAME_PATTERNS = [
+  /\bpatient(?:'s)?\s+name\s+is\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\b/i,
+  /\bname(?:\s+is)?\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\b/i,
+  /\bthis\s+is\s+([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\b/i,
+  /\bwe(?:'ve|\s+have)\s+(?:got\s+)?([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\b/i,
+];
+
+const NAME_STOPWORDS = new Set([
+  "unconscious", "unresponsive", "unknown", "stable", "alert", "awake",
+  "responsive", "breathing", "talking", "approximately", "got", "the",
+  "a", "an", "patient", "male", "female", "no",
+]);
+
 export function extractPatient(rawTranscript) {
   const transcript = (rawTranscript || "").toString();
   const lower = transcript.toLowerCase();
 
   return {
+    name: extractName(transcript),
+    age: extractAge(transcript),
+    sex: extractSex(transcript),
     specification: pickByLastOccurrence(lower, SPEC_KEYWORDS),
     insurance: pickByLastOccurrence(lower, INSURANCE_KEYWORDS),
     location: extractLocation(transcript),
-    age: extractAge(transcript),
-    sex: extractSex(transcript),
     vitals: extractVitals(transcript),
     transcript: transcript.trim(),
   };
@@ -111,6 +142,20 @@ function pickByLastOccurrence(lowerTranscript, keywordMap) {
   }
 
   return best;
+}
+
+function extractName(transcript) {
+  for (const pattern of NAME_PATTERNS) {
+    const match = transcript.match(pattern);
+    const captured = match?.[1]?.trim();
+    if (!captured) continue;
+    const tokens = captured.split(/\s+/);
+    if (NAME_STOPWORDS.has(tokens[0].toLowerCase())) continue;
+    // Require at least one token to be capitalized — proper-noun signal.
+    if (!tokens.some((t) => /^[A-Z]/.test(t))) continue;
+    return captured;
+  }
+  return null;
 }
 
 function extractLocation(transcript) {
