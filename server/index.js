@@ -137,7 +137,7 @@ const PATIENT_NUMBER_FIELDS = new Set([
 const PATIENT_DATE_FIELDS = new Set(["acceptedAt", "createdAt", "updatedAt"]);
 const PATIENT_SEVERITIES = new Set(["critical", "high", "moderate", "low"]);
 const PATIENT_STATUSES = new Set(["active", "routed", "accepted", "arrived", "completed", "cancelled"]);
-const INCOMING_PATIENT_STATUSES = ["active", "routed", "accepted"];
+const INCOMING_PATIENT_STATUSES = ["active", "routed", "accepted", "delivered"];
 const ROUTE_TERMINAL_STATUSES = new Set(["accepted", "arrived", "completed"]);
 
 function hasValue(value) {
@@ -447,6 +447,8 @@ function requireHospitalScope(req, res, next) {
   const claimedId = req.user?.hospitalId;
   const requestedId = req.params.hospitalId || req.query.hospitalId;
   if (!claimedId) return res.status(403).json({ error: "no hospital binding" });
+  // __all__ users can access any hospital's data (all-hospitals dashboard)
+  if (String(claimedId) === "__all__") return next();
   if (requestedId && String(requestedId) !== String(claimedId)) {
     return res.status(403).json({ error: "cannot access another hospital's data" });
   }
@@ -506,13 +508,18 @@ app.post("/api/auth/signup", ah(async (req, res) => {
     if (!hasValue(hospitalId)) {
       return res.status(400).json({ error: "hospitalId is required for hospital role" });
     }
-    const hospitals = await fetchAndCacheHospitals("LOS ANGELES", "CA");
-    const match = hospitals.find((h) => String(h.id) === String(hospitalId));
-    if (!match) {
-      return res.status(400).json({ error: "hospitalId does not match any known hospital" });
+    if (String(hospitalId) === "__all__") {
+      resolvedHospitalId = "__all__";
+      resolvedHospitalName = "All Hospitals (Admin)";
+    } else {
+      const hospitals = await fetchAndCacheHospitals("LOS ANGELES", "CA");
+      const match = hospitals.find((h) => String(h.id) === String(hospitalId));
+      if (!match) {
+        return res.status(400).json({ error: "hospitalId does not match any known hospital" });
+      }
+      resolvedHospitalId = String(match.id);
+      resolvedHospitalName = match.name;
     }
-    resolvedHospitalId = String(match.id);
-    resolvedHospitalName = match.name;
   }
 
   if (role === "admin" && signupAdminToken) {
@@ -780,16 +787,17 @@ app.patch("/api/patients/:patientId/accept", authRequired, requireRole("hospital
     return res.status(400).json({ error: "hospitalId and hospitalName are required" });
   }
 
-  if (String(hospitalId) !== String(req.user.hospitalId)) {
+  const isAdminScope = String(req.user.hospitalId) === "__all__";
+  if (!isAdminScope && String(hospitalId) !== String(req.user.hospitalId)) {
     return res.status(403).json({ error: "cannot accept on behalf of another hospital" });
   }
 
   const existing = await collection.findOne({ patientId: req.params.patientId }, { projection: { _id: 0 } });
   if (!existing) return res.status(404).json({ error: "patient not found" });
   const isRoutedHere =
-    String(existing.recommendedHospitalId ?? "") === String(req.user.hospitalId) ||
-    String(existing.assignedHospitalId ?? "") === String(req.user.hospitalId);
-  if (!isRoutedHere) {
+    String(existing.recommendedHospitalId ?? "") === String(hospitalId) ||
+    String(existing.assignedHospitalId ?? "") === String(hospitalId);
+  if (!isAdminScope && !isRoutedHere) {
     return res.status(403).json({ error: "patient is not routed to your hospital" });
   }
 
@@ -813,7 +821,40 @@ app.patch("/api/patients/:patientId/accept", authRequired, requireRole("hospital
   );
 
   if (!result) return res.status(404).json({ error: "patient not found" });
+
+  // Sync the in-memory request so EMT handoff can transition to delivered
+  const matchingRequest = Object.values(requests).find(
+    (r) => r.patientId === req.params.patientId && r.status === "pending"
+  );
+  if (matchingRequest) {
+    matchingRequest.status = "accepted";
+    matchingRequest.acceptedAt = new Date().toISOString();
+    const matchingDispatch = matchingRequest.dispatchId ? dispatches[matchingRequest.dispatchId] : null;
+    if (matchingDispatch) matchingDispatch.status = "accepted";
+  }
+
   return res.json({ patient: serializePatient(result) });
+}));
+
+app.patch("/api/patients/:patientId/deliver", authRequired, ah(async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) return res.status(503).json({ error: "MongoDB not configured" });
+  const now = new Date();
+  const result = await collection.findOneAndUpdate(
+    { patientId: req.params.patientId },
+    { $set: { status: "delivered", deliveredAt: now, updatedAt: now } },
+    { returnDocument: "after", projection: { _id: 0 } }
+  );
+  if (!result) return res.status(404).json({ error: "patient not found" });
+  return res.json({ ok: true });
+}));
+
+app.delete("/api/patients/:patientId", authRequired, requireRole("hospital"), ah(async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) return res.status(503).json({ error: "MongoDB not configured" });
+  const result = await collection.deleteOne({ patientId: req.params.patientId });
+  if (result.deletedCount === 0) return res.status(404).json({ error: "patient not found" });
+  return res.json({ ok: true });
 }));
 
 app.patch("/api/patients/:patientId", authRequired, ah(async (req, res) => {
@@ -846,12 +887,13 @@ app.get("/api/hospitals/:hospitalId/incoming-patients", authRequired, requireRol
 
   // Use the claim, not the URL param — defense in depth.
   const hospitalId = String(req.user.hospitalId);
+  const isAllHospitals = hospitalId === "__all__";
   const severityOrder = { critical: 0, high: 1, moderate: 2, low: 3 };
+  const query = isAllHospitals
+    ? { status: { $in: INCOMING_PATIENT_STATUSES } }
+    : { status: { $in: INCOMING_PATIENT_STATUSES }, $or: [{ assignedHospitalId: hospitalId }, { recommendedHospitalId: hospitalId }] };
   const patients = await collection
-    .find({
-      status: { $in: INCOMING_PATIENT_STATUSES },
-      $or: [{ assignedHospitalId: hospitalId }, { recommendedHospitalId: hospitalId }],
-    }, { projection: { _id: 0 } })
+    .find(query, { projection: { _id: 0 } })
     .toArray();
 
   patients.sort((a, b) => {
@@ -1135,11 +1177,17 @@ app.patch("/api/requests/:requestId", authRequired, ah(async (req, res) => {
     if (req.user.role === "hospital" && String(record.hospitalId) !== String(req.user.hospitalId)) {
       return res.status(403).json({ error: "cannot modify another hospital's request" });
     }
-    if (record.status !== "accepted") return res.status(409).json({ error: "can only deliver an accepted request" });
+    if (record.status !== "accepted" && record.status !== "pending") return res.status(409).json({ error: "can only deliver an accepted or pending request" });
     record.status = "delivered";
     record.deliveredAt = new Date().toISOString();
     const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
     if (dispatch) dispatch.status = "delivered";
+    if (record.patientId && patientsCollection) {
+      await patientsCollection.findOneAndUpdate(
+        { patientId: record.patientId },
+        { $set: { status: "delivered", deliveredAt: new Date(), updatedAt: new Date() } }
+      );
+    }
     return res.json({ ok: true, requestId, status: "delivered" });
   }
 

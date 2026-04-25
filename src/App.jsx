@@ -307,7 +307,7 @@ function AuthenticatedApp({ user }) {
     fetchHospitalRequests();
     const iv = setInterval(fetchHospitalRequests, 3500);
     return () => clearInterval(iv);
-  }, [activeTab, user.hospitalId]);
+  }, [activeTab, user.hospitalId, user.role]);
 
   // Poll dispatch status while active
   useEffect(() => {
@@ -384,7 +384,8 @@ function AuthenticatedApp({ user }) {
 
   async function fetchHospitalRequests() {
     if (user.role !== "hospital" || !user.hospitalId) return;
-    const res = await apiFetch(`/api/hospitals/${user.hospitalId}/incoming-patients`);
+    const hospitalParam = user.hospitalId === "__all__" ? "__all__" : user.hospitalId;
+    const res = await apiFetch(`/api/hospitals/${hospitalParam}/incoming-patients`);
     const data = await res.json();
     setHospitalRequests((data.patients ?? []).map(patientToRequestCard));
   }
@@ -431,12 +432,24 @@ function AuthenticatedApp({ user }) {
   }
 
   async function handlePatientHandoff() {
-    if (dispatch?.activeRequest?.requestId) {
-      await apiFetch(`/api/requests/${dispatch.activeRequest.requestId}`, {
+    // Try the in-memory request path first, then fall back to direct patient update
+    const requestId = dispatch?.activeRequest?.requestId;
+    const patientId = dispatch?.activeRequest?.patientId ?? dispatch?.patientId ?? currentPatientId ?? patientSummary?.patientId;
+
+    if (requestId) {
+      await apiFetch(`/api/requests/${requestId}`, {
         method: "PATCH",
         body: JSON.stringify({ status: "delivered" }),
       });
+    } else if (patientId) {
+      await apiFetch(`/api/patients/${patientId}/deliver`, { method: "PATCH" });
     }
+
+    // Also always hit the direct patient endpoint to guarantee MongoDB is updated
+    if (patientId) {
+      await apiFetch(`/api/patients/${patientId}/deliver`, { method: "PATCH" }).catch(() => {});
+    }
+
     setHandoffDone(true);
     setTimeout(() => {
       setHandoffDone(false);
@@ -1108,6 +1121,10 @@ function AuthenticatedApp({ user }) {
             requests={hospitalRequests}
             onAccept={(request) => handleRequestAction(request, "accepted")}
             onDivert={(request) => handleRequestAction(request, "diverted")}
+            onDelete={async (request) => {
+              await apiFetch(`/api/patients/${request.patientId}`, { method: "DELETE" });
+              fetchHospitalRequests();
+            }}
           />
         )}
 
@@ -1188,17 +1205,22 @@ async function saveRouteRecommendation(patientId, recommended) {
 }
 
 function patientToRequestCard(patient) {
+  const status = patient.status === "delivered" ? "delivered"
+    : patient.status === "accepted" ? "accepted"
+    : "pending";
   return {
     source: "patient",
     requestId: patient.patientId,
     patientId: patient.patientId,
     hospitalId: patient.assignedHospitalId ?? patient.recommendedHospitalId,
     hospitalName: patient.assignedHospitalName ?? patient.recommendedHospitalName,
-    status: patient.status === "accepted" ? "accepted" : "pending",
+    status,
     insurance: patient.insuranceProvider,
     patientSummary: patient,
     etaMins: patient.etaMinutes,
     requestedAt: patient.updatedAt ?? patient.createdAt ?? new Date().toISOString(),
+    acceptedAt: patient.acceptedAt ?? null,
+    deliveredAt: patient.deliveredAt ?? null,
   };
 }
 
@@ -1258,10 +1280,10 @@ function ElapsedTimer({ since }) {
   const s = Math.max(0, Math.floor(ms / 1000));
   const mm = Math.floor(s / 60);
   const ss = String(s % 60).padStart(2, "0");
-  return <span className="font-mono text-sm font-semibold text-emerald-300">{mm}:{ss}</span>;
+  return <span className="font-mono text-sm font-semibold text-amber-300">{mm}:{ss}</span>;
 }
 
-function HospitalView({ hospitalName, requests, onAccept, onDivert }) {
+function HospitalView({ hospitalName, requests, onAccept, onDivert, onDelete }) {
   const [reportReq, setReportReq] = useState(null);
   return (
     <section className="grid min-h-0 grid-rows-[auto_1fr] gap-4">
@@ -1281,24 +1303,32 @@ function HospitalView({ hospitalName, requests, onAccept, onDivert }) {
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {requests.map((req) => (
-              <div key={req.requestId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
+              <div key={req.requestId} className="relative rounded-xl border border-slate-700 bg-slate-900/60 p-4">
+                <button
+                  type="button"
+                  onClick={() => onDelete(req)}
+                  className="absolute right-2 top-2 flex h-5 w-5 items-center justify-center rounded-full text-slate-500 transition hover:bg-slate-700 hover:text-slate-200"
+                  title="Remove record"
+                >
+                  ×
+                </button>
                 <div className="flex flex-wrap items-center gap-2">
                   {req.escalatedFrom && <span className="rounded-full border border-orange-400/30 bg-orange-400/10 px-2.5 py-1 text-xs font-semibold text-orange-200">Rerouted from {req.escalatedFrom}</span>}
                   {req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Auto-Approved</span>}
                   {req.status === "accepted" && !req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Accepted</span>}
                   {req.status === "diverted" && <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-200">Diverted</span>}
                   {req.status === "pending" && <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-200">Pending</span>}
-                  {req.status === "delivered" && <span className="rounded-full border border-red-500/40 bg-red-500/15 px-2.5 py-1 text-xs font-semibold text-red-300">Patient Arrived</span>}
+                  {req.status === "delivered" && <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 text-xs font-semibold text-emerald-300">Patient Arrived</span>}
                 </div>
                 <p className="mt-3 font-semibold text-slate-100">{req.hospitalName}</p>
                 <div className="mt-2 space-y-1 text-sm text-slate-300">
                   <p>ETA: <span className="text-slate-100">{req.etaMins != null ? `${req.etaMins} min` : "--"}</span></p>
                   {req.insurance && <p>Insurance: <span className="text-slate-100">{req.insurance}</span></p>}
                   {(req.status === "accepted" || req.status === "delivered") && req.acceptedAt && (
-                    <div className={`mt-2 flex items-center justify-between rounded-md border px-3 py-2 ${req.status === "delivered" ? "border-red-500/20 bg-red-500/10" : "border-emerald-500/20 bg-emerald-500/10"}`}>
-                      <span className={`text-xs ${req.status === "delivered" ? "text-red-300" : "text-emerald-300"}`}>{req.status === "delivered" ? "Total time" : "En route"}</span>
+                    <div className={`mt-2 flex items-center justify-between rounded-md border px-3 py-2 ${req.status === "delivered" ? "border-emerald-500/20 bg-emerald-500/10" : "border-amber-500/20 bg-amber-500/10"}`}>
+                      <span className={`text-xs ${req.status === "delivered" ? "text-emerald-300" : "text-amber-300"}`}>{req.status === "delivered" ? "Total time" : "En route"}</span>
                       {req.status === "delivered"
-                        ? <span className="font-mono text-sm font-semibold text-red-300">{(() => { const s = Math.max(0, Math.floor((new Date(req.deliveredAt) - new Date(req.acceptedAt)) / 1000)); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; })()}</span>
+                        ? <span className="font-mono text-sm font-semibold text-emerald-300">{(() => { const s = Math.max(0, Math.floor((new Date(req.deliveredAt) - new Date(req.acceptedAt)) / 1000)); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; })()}</span>
                         : <ElapsedTimer since={req.acceptedAt} />
                       }
                     </div>

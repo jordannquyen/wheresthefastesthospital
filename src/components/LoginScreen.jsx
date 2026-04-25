@@ -175,6 +175,7 @@ export function LoginScreen({ pageRole }) {
                     required
                   >
                     <option value="">{loadingHospitals ? "Loading hospitals…" : "Select a hospital"}</option>
+                    <option value="__all__">All Hospitals (Admin)</option>
                     {hospitalsList.map((h) => (
                       <option key={h.id} value={h.id}>{h.name}</option>
                     ))}
