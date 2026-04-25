@@ -10,6 +10,7 @@ import {
 } from "@react-google-maps/api";
 import { useVoice } from "./hooks/useVoice.js";
 import { extractPatient } from "./lib/extractPatient.js";
+import logo from "./assets/logo_nobkg.png";
 
 const isAdminMode = new URLSearchParams(window.location.search).has("admin");
 const centerGL = { lat: 20, lng: 0 };
@@ -493,9 +494,12 @@ function App() {
   return (
     <main className="screen bg-grid text-slate-100">
       <section className="mx-auto grid h-full w-full max-w-[1500px] grid-rows-[auto_auto_1fr] gap-4 p-4 lg:p-6">
-        <header className="rounded-xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
-          <h1 className="text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
-          <p className="mt-1 text-sm text-slate-300">optimize saving lives</p>
+        <header className="flex items-center gap-4 rounded-xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
+          <img src={logo} alt="Vital-Route logo" className="h-10 w-auto" />
+          <div>
+            <h1 className="text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
+            <p className="mt-1 text-sm text-slate-300">optimize saving lives</p>
+          </div>
         </header>
 
         <nav className="flex gap-1 rounded-xl border border-slate-700 bg-slate-950/70 p-1">
