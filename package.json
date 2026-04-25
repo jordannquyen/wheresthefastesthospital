@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "concurrently \"npm:dev:server\" \"npm:dev:client\"",
     "dev:client": "vite",
-    "dev:server": "node --watch server/index.js",
+    "dev:server": "npx nodemon server/index.js",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
