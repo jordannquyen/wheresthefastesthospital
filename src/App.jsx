@@ -51,6 +51,16 @@ function App() {
     return () => clearInterval(pulseInterval);
   }, []);
 
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      setResolvedAddress("Current location");
+      await fetchHospitalsByCoords(loc.lat, loc.lng);
+      await requestRecommendations(loc);
+    });
+  }, []);
+
   // Poll hospital requests while on hospital tab
   useEffect(() => {
     if (activeTab !== "hospital") return;
