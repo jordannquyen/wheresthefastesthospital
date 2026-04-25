@@ -357,7 +357,7 @@ function App() {
                       <Circle
                         key={`circle-${node.id}`}
                         center={{ lat: node.lat, lng: node.lng }}
-                        radius={congested ? (pulseTick ? 1550 : 1150) : 960}
+                        radius={congested ? 1350 : 960}
                         options={{
                           fillColor: color,
                           fillOpacity: congested ? 0.46 : 0.26,
@@ -381,7 +381,7 @@ function App() {
                         onClick={() => setSelectedHospitalId(node.id)}
                         icon={{
                           path: window.google.maps.SymbolPath.CIRCLE,
-                          scale: util >= 0.9 && pulseTick ? 10 : 8,
+                          scale: 8,
                           fillColor: getNodeColor(util),
                           fillOpacity: 1,
                           strokeColor: "#e2e8f0",
@@ -550,6 +550,7 @@ function App() {
                         <div key={candidate.id} className="rounded-md border border-slate-700 bg-slate-900/60 p-2">
                           <p className="flex items-center gap-2 font-medium text-slate-100">
                             <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 text-sm font-bold text-cyan-300">{rankLabels[index]}</span>
+                            <span className="inline-block h-2.5 w-2.5 flex-shrink-0 rounded-full" style={{ backgroundColor: getNodeColor(candidate.utilization) }} />
                             {candidate.name}
                             {index === 0 && dispatch?.activeRequest?.autoApproved && (
                               <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">Auto-Accepted</span>
