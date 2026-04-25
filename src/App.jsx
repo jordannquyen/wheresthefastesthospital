@@ -9,8 +9,8 @@ import {
   useJsApiLoader,
 } from "@react-google-maps/api";
 
-const centerLA = { lat: 34.0522, lng: -118.2437 };
-const defaultZoom = 10.5;
+const centerGL = { lat: 20, lng: 0 };
+const defaultZoom = 2;
 const mapContainerStyle = { width: "100%", height: "100%" };
 const mapsApiKey = import.meta.env.GOOGLE_MAPS_API_KEY;
 const mapsLibraries = ["places"];
@@ -24,12 +24,14 @@ function App() {
   const [pulseTick, setPulseTick] = useState(false);
   const [provider, setProvider] = useState("fallback");
   const [selectedHospitalId, setSelectedHospitalId] = useState(null);
-  const [locationAddress, setLocationAddress] = useState("Santa Monica Pier, Los Angeles");
+  const [locationAddress, setLocationAddress] = useState("");
   const [resolvedAddress, setResolvedAddress] = useState("");
   const [locationError, setLocationError] = useState("");
   const [specification, setSpecification] = useState("");
   const [insurance, setInsurance] = useState("");
   const [addressAutocomplete, setAddressAutocomplete] = useState(null);
+  const [mapCenter, setMapCenter] = useState(centerGL);
+  const [mapZoom, setMapZoom] = useState(defaultZoom);
 
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
@@ -38,28 +40,50 @@ function App() {
   });
 
   useEffect(() => {
-    fetchNodes();
-    fetchTelemetry();
-
-    const telemetryInterval = setInterval(fetchTelemetry, 10_000);
     const pulseInterval = setInterval(() => setPulseTick((current) => !current), 900);
-
-    return () => {
-      clearInterval(telemetryInterval);
-      clearInterval(pulseInterval);
-    };
+    return () => clearInterval(pulseInterval);
   }, []);
 
-  async function fetchNodes() {
-    const response = await fetch("/api/nodes");
-    const data = await response.json();
-    setNodes(data.nodes ?? []);
-  }
+  useEffect(() => {
+    // Only fetch telemetry if we have hospitals loaded
+    if (nodes.length === 0) {
+      return;
+    }
+
+    fetchTelemetry();
+    const telemetryInterval = setInterval(fetchTelemetry, 10_000);
+    return () => clearInterval(telemetryInterval);
+  }, [nodes]);
 
   async function fetchTelemetry() {
+    // Only fetch if we have nodes (means we're in a geocoded area)
+    if (nodes.length === 0) {
+      return;
+    }
+
     const response = await fetch("/api/telemetry");
     const data = await response.json();
     setTelemetry(data.nodes ?? {});
+  }
+
+  async function fetchHospitalsByCoords(lat, lng) {
+    try {
+      const response = await fetch("/api/hospitals-by-coords", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat, lng }),
+      });
+
+      const data = await response.json();
+      if (response.ok) {
+        setNodes(data.nodes ?? []);
+        setMapCenter({ lat, lng });
+        setMapZoom(10.5);
+      }
+    } catch (error) {
+      console.error("Error fetching hospitals by coords:", error);
+      setLocationError("Unable to fetch hospitals for this location");
+    }
   }
 
   async function handleMapClick(event) {
@@ -101,10 +125,15 @@ function App() {
   const selectedHospital = nodes.find((node) => node.id === selectedHospitalId) ?? null;
   const selectedTelemetry = selectedHospital ? telemetry[selectedHospital.id] ?? null : null;
 
+  const [addressInputRef, setAddressInputRef] = useState(null);
+
   async function handleLocationSubmit(event) {
     event.preventDefault();
 
-    if (!locationAddress.trim()) {
+    // Get the actual value from the input element (in case of manual typing)
+    const addressValue = addressInputRef?.value?.trim() || locationAddress.trim();
+
+    if (!addressValue) {
       setLocationError("Enter an address to continue.");
       return;
     }
@@ -114,7 +143,7 @@ function App() {
       const geocodeResponse = await fetch("/api/geocode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: locationAddress.trim() }),
+        body: JSON.stringify({ address: addressValue }),
       });
 
       const geocodeData = await geocodeResponse.json();
@@ -123,7 +152,13 @@ function App() {
         return;
       }
 
-      setResolvedAddress(geocodeData.formattedAddress ?? locationAddress.trim());
+      setLocationAddress(geocodeData.formattedAddress ?? addressValue);
+      setResolvedAddress(geocodeData.formattedAddress ?? addressValue);
+
+      // Fetch hospitals for this location
+      await fetchHospitalsByCoords(geocodeData.location.lat, geocodeData.location.lng);
+
+      // Then request recommendations
       await requestRecommendations(geocodeData.location);
     } catch (_error) {
       setLocationError("Unable to geocode this address right now.");
@@ -135,21 +170,26 @@ function App() {
       return;
     }
 
-    const first = addressAutocomplete.getPlace?.();
-    const location = first?.geometry?.location;
-
-    if (!location) {
+    const place = addressAutocomplete.getPlace?.();
+    if (!place || !place.geometry) {
       return;
     }
 
+    const location = place.geometry.location;
     const selectedOrigin = {
       lat: Number(location.lat().toFixed(6)),
       lng: Number(location.lng().toFixed(6)),
     };
 
-    setLocationAddress(first.formatted_address ?? first.name ?? locationAddress);
-    setResolvedAddress(first.formatted_address ?? first.name ?? "Selected from autocomplete");
+    const formattedAddress = place.formatted_address || place.name || "";
+    setLocationAddress(formattedAddress);
+    setResolvedAddress(formattedAddress);
     setLocationError("");
+
+    // Fetch hospitals for this location
+    await fetchHospitalsByCoords(selectedOrigin.lat, selectedOrigin.lng);
+
+    // Then request recommendations
     await requestRecommendations(selectedOrigin);
   }
 
@@ -158,7 +198,7 @@ function App() {
       <main className="screen bg-grid text-slate-100">
         <div className="mx-auto max-w-3xl rounded-2xl border border-cyan-400/40 bg-slate-900/90 p-8 shadow-2xl shadow-cyan-600/20">
           <p className="font-mono text-xs uppercase tracking-[0.22em] text-cyan-300">
-            Vital-Route LA Demo
+            wtf-hospital
           </p>
           <h1 className="mt-2 text-3xl font-semibold">Google API key required</h1>
           <p className="mt-3 text-slate-300">
@@ -182,13 +222,8 @@ function App() {
         <header className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
             <div>
-              <p className="font-mono text-[11px] uppercase tracking-[0.25em] text-cyan-300">ARISTA Connect The Dots | Los Angeles Region</p>
-              <h1 className="mt-1 text-3xl font-semibold tracking-tight lg:text-4xl">Vital-Route: Healthcare Load Balancer</h1>
-              <p className="mt-2 text-sm text-slate-300 lg:text-base">Click any point in Los Angeles to route a patient packet by minimum cost, not nearest hospital.</p>
-            </div>
-            <div className="rounded-xl border border-cyan-400/50 bg-slate-950/80 px-4 py-3">
-              <p className="font-mono text-xs uppercase tracking-wide text-slate-300">Routing Provider</p>
-              <p className="text-2xl text-cyan-300">{provider.toUpperCase()}</p>
+              <h1 className="mt-1 text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
+              <p className="mt-2 text-sm text-slate-300 lg:text-base">a tool for emts to optimize saving lives</p>
             </div>
           </div>
         </header>
@@ -198,8 +233,8 @@ function App() {
             {isLoaded && (
               <GoogleMap
                 mapContainerStyle={mapContainerStyle}
-                center={centerLA}
-                zoom={defaultZoom}
+                center={mapCenter}
+                zoom={mapZoom}
                 options={mapOptions}
                 onClick={handleMapClick}
               >
@@ -339,11 +374,11 @@ function App() {
                     }}
                   >
                     <input
+                      ref={setAddressInputRef}
                       type="text"
-                      value={locationAddress}
                       onChange={(event) => setLocationAddress(event.target.value)}
                       className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
-                      placeholder="Start typing an address in Los Angeles"
+                      placeholder="Start typing an address"
                     />
                   </Autocomplete>
                 ) : (
