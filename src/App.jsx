@@ -242,38 +242,40 @@ function AuthenticatedApp({ user }) {
   }, []);
 
   // Run once after Google Maps SDK is loaded: attempt GPS, fall back to IP
-  // geolocation on failure (common on Mac when system permissions are denied).
-  // Hospital staff don't need the EMT map flow, so skip the auto-init for them.
+  // Attempt GPS → ip-api.com → LA default. Runs immediately on mount,
+  // independent of Google Maps loading. Reverse geocoding waits for isLoaded.
   const didAutofillGpsRef = useRef(false);
   useEffect(() => {
-    if (user.role === "hospital") return;
     if (!isLoaded || didAutofillGpsRef.current) return;
     didAutofillGpsRef.current = true;
 
     async function initLocation() {
       let loc = null;
+      let source = null;
 
       if (navigator.geolocation) {
         loc = await new Promise((resolve) => {
           navigator.geolocation.getCurrentPosition(
             (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
-            () => resolve(null),
+            (err) => { console.warn("GPS:", err.message); resolve(null); },
             { enableHighAccuracy: false, timeout: 6_000, maximumAge: 300_000 },
           );
         });
+        if (loc) source = "gps";
       }
 
       if (!loc) {
         try {
           const r = await fetch("https://ipapi.co/json/");
-          if (r.ok) {
-            const d = await r.json();
-            if (d.latitude && d.longitude) loc = { lat: d.latitude, lng: d.longitude };
+          // ip-api.com: free tier is HTTP only, 45 req/min, no key required
           }
         } catch { /* ignore */ }
       }
+      }
 
       if (!loc) return;
+
+      // Reverse geocoding needs Google Maps — wait up to 6 s for it to load
 
       const formatted = window.google?.maps?.Geocoder ? await reverseGeocode(loc) : null;
       const display = formatted ?? `${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}`;
@@ -284,7 +286,7 @@ function AuthenticatedApp({ user }) {
     }
 
     initLocation();
-  }, [isLoaded]);
+  }, []);
 
   function reverseGeocode(loc) {
     return new Promise((resolve) => {
@@ -598,7 +600,7 @@ function AuthenticatedApp({ user }) {
       const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
 
       if (resolvedOrigin) {
-        const routeData = await requestRecommendations(resolvedOrigin, { insurance: summary.insuranceProvider, patientId: summary.patientId });
+        const routeData = await requestRecommendations(resolvedOrigin, { insurance: summary.insuranceProvider, patientId: summary.patientId, condition: summary.condition });
         const dispatchData = await autoDispatch(routeData, summary.insuranceProvider, summary);
         const hospital = dispatchData?.currentHospital;
         const req = dispatchData?.activeRequest;
@@ -637,6 +639,7 @@ function AuthenticatedApp({ user }) {
     setSentRequests({});
     setDispatch(null);
     const effectiveInsurance = overrides.insurance ?? insurance;
+    const effectiveCondition = overrides.condition ?? patientSummary?.condition ?? null;
     const res = await apiFetch("/api/route", {
       method: "POST",
       body: JSON.stringify({
@@ -847,13 +850,9 @@ function AuthenticatedApp({ user }) {
                 </GoogleMap>
               )}
 
-              {(resolvedAddress || editingLocation) && (
                 <div
-                  className={`absolute left-3 top-3 max-w-[280px] rounded-lg border border-slate-600/90 bg-slate-950/85 px-3 py-2 backdrop-blur transition-shadow ${editingLocation ? "ring-1 ring-cyan-500/60" : "cursor-pointer hover:border-slate-400/80"}`}
-                  onClick={!editingLocation ? () => { setLocationDraft(resolvedAddress); setEditingLocation(true); } : undefined}
-                >
-                  <p className="font-mono text-[10px] uppercase tracking-wide text-cyan-400">
-                    {editingLocation ? "Enter address" : "Current location"}
+              <div
+                className={`absolute left-3 top-3 max-w-[280px] rounded-lg border border-slate-600/90 bg-slate-950/85 px-3 py-2 backdrop-blur transition-shadow ${editingLocation ? "ring-1 ring-cyan-500/60" : "cursor-pointer hover:border-slate-400/80"}`}
                   </p>
                   {editingLocation ? (
                     <Autocomplete
@@ -863,7 +862,6 @@ function AuthenticatedApp({ user }) {
                       <input
                         autoFocus
                         value={locationDraft}
-                        onChange={(e) => setLocationDraft(e.target.value)}
                         onKeyDown={(e) => {
                           if (e.key === "Escape") setEditingLocation(false);
                           if (e.key === "Enter") handleLocationManualSubmit();
@@ -1027,6 +1025,13 @@ function AuthenticatedApp({ user }) {
                               <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">Accepted</span>
                             )}
                           </p>
+                              {candidate.traumaLevel && (
+                                <span className="rounded-full border border-orange-400/40 bg-orange-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-orange-300">
+                                  Trauma Lvl {candidate.traumaLevel}
+                                </span>
+                              )}
+                              {candidate.strokeCapable && (
+                                <span className="rounded-full border border-violet-400/40 bg-violet-400/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-violet-300">
                           <p className="mt-1 text-xs text-slate-300">
                             {candidate.distanceMiles} mi ({candidate.durationMins} min) | {candidate.availableBeds} beds avail ({Math.round(candidate.utilization * 100)}% util) | {candidate.waitMins} min wait
                           </p>

@@ -622,8 +622,6 @@ Schema (use null for any field not mentioned):
 }
 
 Field rules:
-- condition: simple broad category such as "cardiac", "stroke", "trauma", "respiratory", or "unknown"
-- severity: use "critical" for unstable vitals/life threat, "high" for serious, "moderate" for concerning but stable, "low" for minor
 - bloodPressure: "systolic/diastolic" string e.g. "120/80"
 - address: geocodable address or landmark where the patient is
 - chiefComplaint: primary presenting problem in plain language (NOT insurance, NOT demographics)
@@ -969,11 +967,13 @@ app.post("/api/geocode", authRequired, async (req, res) => {
 
 app.post("/api/route", authRequired, async (req, res) => {
   const { origin, insurance } = req.body ?? {};
+  const { origin, condition, insurance } = req.body ?? {};
   if (!origin || typeof origin.lat !== "number" || typeof origin.lng !== "number") {
     return res.status(400).json({ error: "origin.lat and origin.lng are required numeric fields" });
   }
   try {
     const routeResult = await computeRoute(origin, insurance);
+    const routeResult = await computeRoute(origin, condition ?? null, insurance);
     res.json(routeResult);
   } catch (error) {
     console.error("Routing error", error);
@@ -1215,6 +1215,11 @@ app.get("/api/admin/overrides", authRequired, requireRole("admin"), (_req, res) 
   return res.json({ overrides: hospitalOverrides });
 });
 
+app.get("/api/debug/specialty", (_req, res) => {
+  const age = specialtyCache.ts ? Math.round((Date.now() - specialtyCache.ts) / 1000) : null;
+  const sampleTrauma = [...(specialtyCache.traumaByName?.entries() ?? [])].slice(0, 5).map(([k, v]) => `${k}→${v}`);
+  const sampleStroke = [...(specialtyCache.strokeByCCN?.values() ?? [])].slice(0, 5);
+  const sampleCardiac = [...(specialtyCache.cardiacByCCN?.values() ?? [])].slice(0, 5);
 // eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error("Unhandled route error:", err);
@@ -1225,6 +1230,7 @@ initializeMongo()
   .then(() => {
     app.listen(port, () => {
       console.log(`Vital-Route backend listening on http://localhost:${port}`);
+      fetchSpecialtyData().catch((err) => console.warn("Specialty pre-warm failed:", err.message));
     });
   })
   .catch((error) => {
@@ -1234,7 +1240,7 @@ initializeMongo()
 
 // --- Routing pipeline ---
 
-async function computeRoute(origin, insurance) {
+async function computeRoute(origin, condition, insurance) {
   const allNodes = await fetchHospitalsByDistance(origin.lat, origin.lng, 50);
   const normalizedInsurance = normalizeInsurance(insurance);
   const nodes = allNodes.slice(0, 25);
@@ -1258,7 +1264,7 @@ async function computeRoute(origin, insurance) {
     };
   });
 
-  const ranked = [...scored].sort((a, b) => scoreHospital(b) - scoreHospital(a));
+  const ranked = [...scored].sort((a, b) => scoreHospital(b, condition) - scoreHospital(a, condition));
 
   let candidates = ranked;
   const insurancePool = normalizedInsurance
@@ -1274,9 +1280,10 @@ async function computeRoute(origin, insurance) {
 
   return {
     origin,
+    condition: condition ?? null,
     insurance: normalizedInsurance,
     insuranceMatchFound,
-    model: "cost = ETA + waitMins + statusPenalty(Open=0,Sat=0,Div=3)",
+    model: "cost = (ETA + waitMins + statusPenalty) / specialtyMultiplier",
     closest,
     recommended,
     top3,
@@ -1356,15 +1363,16 @@ function deriveStatus(utilization) {
   return "Open";
 }
 
-function scoreHospital(node) {
-  // Lower cost = better. Total time (ETA + waitMins) is primary;
-  // status adds a flat minute-equivalent penalty so red hospitals lose to
-  // equivalently-close green ones but aren't excluded entirely.
+function scoreHospital(node, condition) {
+  // Lower time cost = better. Specialty multiplier divides effective cost so a
+  // matched Level I trauma center or stroke-capable hospital appears "closer".
   const STATUS_PENALTY = { Open: 0, Saturation: 0, Diversion: 3 };
   const eta = node.durationMins || 1;
   const waitMins = node.waitMins || 0;
   const penalty = STATUS_PENALTY[node.status] ?? 0;
   return -(eta + waitMins + penalty);
+  const multiplier = getSpecialtyMultiplier(node, condition);
+  return -(eta + waitMins + penalty) / multiplier;
 }
 
 function normalizeInsurance(input) {
