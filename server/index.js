@@ -8,6 +8,11 @@ import { getNodes, getTelemetry, jitterTelemetry } from "./telemetry.js";
 dotenv.config();
 
 const requests = {};
+const dispatches = {};
+const hospitalOverrides = {}; // { [hospitalId]: "Open" | "Saturation" | "Diversion" }
+// dispatch shape:
+// { dispatchId, chain: [{hospitalId, hospitalName, etaMins}], currentIndex,
+//   patientSpec, insurance, activeRequestId, status: "active"|"accepted"|"exhausted", createdAt }
 
 const app = express();
 const googleMapsClient = new Client({});
@@ -83,28 +88,58 @@ app.post("/api/route", async (req, res) => {
   }
 });
 
-app.post("/api/requests", (req, res) => {
-  const { hospitalId, hospitalName, patientSpec, insurance, etaMins } = req.body ?? {};
+app.post("/api/dispatch", (req, res) => {
+  const { chain, patientSpec, insurance } = req.body ?? {};
   const knownIds = getNodes().map((n) => n.id);
-  if (!hospitalId || !knownIds.includes(hospitalId)) {
-    return res.status(400).json({ error: "valid hospitalId is required" });
+
+  if (!Array.isArray(chain) || chain.length === 0) {
+    return res.status(400).json({ error: "chain must be a non-empty array" });
+  }
+  if (chain.some((h) => !knownIds.includes(h.hospitalId))) {
+    return res.status(400).json({ error: "all chain entries must have a valid hospitalId" });
   }
 
-  const autoApproved = shouldAutoApprove(hospitalId);
-  const requestId = randomUUID();
-  requests[requestId] = {
-    requestId,
-    hospitalId,
-    hospitalName: hospitalName ?? hospitalId,
+  const dispatchId = randomUUID();
+  const dispatch = {
+    dispatchId,
+    chain,
+    currentIndex: 0,
     patientSpec: patientSpec ?? null,
     insurance: insurance ?? null,
-    etaMins: etaMins ?? null,
-    status: autoApproved ? "accepted" : "pending",
-    autoApproved,
-    requestedAt: new Date().toISOString(),
+    activeRequestId: null,
+    status: "active",
+    createdAt: new Date().toISOString(),
   };
+  dispatches[dispatchId] = dispatch;
 
-  return res.json({ requestId, status: requests[requestId].status, autoApproved });
+  const requestId = createRequest(dispatch, 0, null);
+  dispatch.activeRequestId = requestId;
+
+  return res.json({ dispatchId, requestId, status: requests[requestId].status, autoApproved: requests[requestId].autoApproved });
+});
+
+app.get("/api/dispatch/:dispatchId", (req, res) => {
+  const dispatch = dispatches[req.params.dispatchId];
+  if (!dispatch) return res.status(404).json({ error: "dispatch not found" });
+
+  const activeRequest = requests[dispatch.activeRequestId] ?? null;
+  const chainWithStatus = dispatch.chain.map((entry, index) => {
+    const req = Object.values(requests).find(
+      (r) => r.dispatchId === dispatch.dispatchId && r.chainIndex === index
+    );
+    return { ...entry, requestStatus: req?.status ?? null, requestId: req?.requestId ?? null };
+  });
+
+  return res.json({
+    dispatchId: dispatch.dispatchId,
+    status: dispatch.status,
+    currentIndex: dispatch.currentIndex,
+    currentHospital: dispatch.chain[dispatch.currentIndex] ?? null,
+    activeRequest,
+    chain: chainWithStatus,
+    patientSpec: dispatch.patientSpec,
+    insurance: dispatch.insurance,
+  });
 });
 
 app.get("/api/requests", (req, res) => {
@@ -129,7 +164,54 @@ app.patch("/api/requests/:requestId", (req, res) => {
   }
 
   record.status = status;
-  return res.json({ ok: true, requestId, status });
+
+  const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
+  if (dispatch) {
+    if (status === "accepted") {
+      dispatch.status = "accepted";
+    } else if (status === "diverted") {
+      const nextIndex = dispatch.currentIndex + 1;
+      if (nextIndex < dispatch.chain.length) {
+        dispatch.currentIndex = nextIndex;
+        const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
+        dispatch.activeRequestId = nextRequestId;
+      } else {
+        dispatch.status = "exhausted";
+      }
+    }
+  }
+
+  return res.json({ ok: true, requestId, status, dispatch: dispatch ?? null });
+});
+
+app.post("/api/admin/override", (req, res) => {
+  const { hospitalId, status } = req.body ?? {};
+  const knownIds = getNodes().map((n) => n.id);
+  if (!knownIds.includes(hospitalId)) return res.status(400).json({ error: "invalid hospitalId" });
+  if (!["Open", "Saturation", "Diversion"].includes(status)) return res.status(400).json({ error: "status must be Open, Saturation, or Diversion" });
+  hospitalOverrides[hospitalId] = status;
+  return res.json({ ok: true, hospitalId, status });
+});
+
+app.delete("/api/admin/override/:hospitalId", (req, res) => {
+  delete hospitalOverrides[req.params.hospitalId];
+  return res.json({ ok: true, hospitalId: req.params.hospitalId });
+});
+
+app.get("/api/admin/overrides", (_req, res) => {
+  const telemetry = getTelemetry().nodes;
+  const nodes = getNodes();
+  const summary = nodes.map((node) => ({
+    hospitalId: node.id,
+    hospitalName: node.name,
+    override: hospitalOverrides[node.id] ?? null,
+    autoStatus: deriveStatus(telemetry[node.id]?.utilization ?? 0),
+    effectiveStatus: getEffectiveStatus(node.id, telemetry[node.id]?.utilization ?? 0),
+    utilization: telemetry[node.id]?.utilization ?? null,
+    availableBeds: telemetry[node.id]?.availableBeds ?? null,
+    waitMins: telemetry[node.id]?.waitMins ?? null,
+  }));
+  return res.json({ overrides: hospitalOverrides, hospitals: summary });
 });
 
 setInterval(() => {
@@ -273,12 +355,36 @@ async function getTravelMetrics(origin, nodes) {
   });
 }
 
+function createRequest(dispatch, chainIndex, escalatedFromName) {
+  const entry = dispatch.chain[chainIndex];
+  const autoApproved = shouldAutoApprove(entry.hospitalId);
+  const requestId = randomUUID();
+  requests[requestId] = {
+    requestId,
+    dispatchId: dispatch.dispatchId,
+    chainIndex,
+    hospitalId: entry.hospitalId,
+    hospitalName: entry.hospitalName,
+    patientSpec: dispatch.patientSpec,
+    insurance: dispatch.insurance,
+    etaMins: entry.etaMins,
+    escalatedFrom: escalatedFromName ?? null,
+    status: autoApproved ? "accepted" : "pending",
+    autoApproved,
+    requestedAt: new Date().toISOString(),
+  };
+  return requestId;
+}
+
 function shouldAutoApprove(hospitalId) {
   const state = getTelemetry().nodes[hospitalId];
   if (!state) return false;
-  return deriveStatus(state.utilization) === "Open"
-    && state.availableBeds >= 5
-    && state.waitMins <= 60;
+  const status = hospitalOverrides[hospitalId] ?? deriveStatus(state.utilization);
+  return status === "Open" && state.availableBeds >= 5 && state.waitMins <= 60;
+}
+
+function getEffectiveStatus(hospitalId, utilization) {
+  return hospitalOverrides[hospitalId] ?? deriveStatus(utilization);
 }
 
 function deriveStatus(utilization) {

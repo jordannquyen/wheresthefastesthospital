@@ -9,6 +9,7 @@ import {
   useJsApiLoader,
 } from "@react-google-maps/api";
 
+const isAdminMode = new URLSearchParams(window.location.search).has("admin");
 const centerLA = { lat: 34.0522, lng: -118.2437 };
 const defaultZoom = 10.5;
 const mapContainerStyle = { width: "100%", height: "100%" };
@@ -32,8 +33,9 @@ function App() {
   const [addressAutocomplete, setAddressAutocomplete] = useState(null);
   const [activeTab, setActiveTab] = useState("emt");
   const [hospitalRequests, setHospitalRequests] = useState([]);
-  const [sentRequests, setSentRequests] = useState({});
   const [selectedHospitalFilter, setSelectedHospitalFilter] = useState("");
+  const [dispatch, setDispatch] = useState(null);
+  const [adminHospitals, setAdminHospitals] = useState([]);
 
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
@@ -74,6 +76,42 @@ function App() {
     setTelemetry(data.nodes ?? {});
   }
 
+  useEffect(() => {
+    if (activeTab !== "admin") return;
+    fetchAdminOverrides();
+    const interval = setInterval(fetchAdminOverrides, 4000);
+    return () => clearInterval(interval);
+  }, [activeTab]);
+
+  async function fetchAdminOverrides() {
+    const res = await fetch("/api/admin/overrides");
+    const data = await res.json();
+    setAdminHospitals(data.hospitals ?? []);
+  }
+
+  async function handleAdminOverride(hospitalId, status) {
+    if (status === null) {
+      await fetch(`/api/admin/override/${hospitalId}`, { method: "DELETE" });
+    } else {
+      await fetch("/api/admin/override", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hospitalId, status }),
+      });
+    }
+    fetchAdminOverrides();
+  }
+
+  useEffect(() => {
+    if (!dispatch?.dispatchId || dispatch.status !== "active") return;
+    const interval = setInterval(async () => {
+      const res = await fetch(`/api/dispatch/${dispatch.dispatchId}`);
+      const data = await res.json();
+      setDispatch(data);
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [dispatch?.dispatchId, dispatch?.status]);
+
   async function fetchHospitalRequests() {
     const params = selectedHospitalFilter ? `?hospitalId=${selectedHospitalFilter}` : "";
     const response = await fetch(`/api/requests${params}`);
@@ -81,21 +119,26 @@ function App() {
     setHospitalRequests(data.requests ?? []);
   }
 
-  async function handleRequest(candidate) {
-    const response = await fetch("/api/requests", {
+  async function handleDispatch() {
+    if (!route?.top3?.length) return;
+    const chain = route.top3.map((h) => ({
+      hospitalId: h.id,
+      hospitalName: h.name,
+      etaMins: h.durationMins,
+    }));
+    const response = await fetch("/api/dispatch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        hospitalId: candidate.id,
-        hospitalName: candidate.name,
+        chain,
         patientSpec: specification || null,
         insurance: insurance || null,
-        etaMins: candidate.durationMins,
       }),
     });
     const data = await response.json();
     if (response.ok) {
-      setSentRequests((prev) => ({ ...prev, [candidate.id]: data.requestId }));
+      const res = await fetch(`/api/dispatch/${data.dispatchId}`);
+      setDispatch(await res.json());
     }
   }
 
@@ -121,7 +164,7 @@ function App() {
 
   async function requestRecommendations(inputOrigin) {
     setOrigin(inputOrigin);
-    setSentRequests({});
+    setDispatch(null);
     const response = await fetch("/api/route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -233,18 +276,18 @@ function App() {
         </header>
 
         <nav className="flex gap-2 rounded-2xl border border-slate-700 bg-slate-950/70 p-2">
-          {["emt", "hospital"].map((tab) => (
+          {["emt", "hospital", ...(isAdminMode ? ["admin"] : [])].map((tab) => (
             <button
               key={tab}
               type="button"
               onClick={() => setActiveTab(tab)}
               className={`rounded-xl px-5 py-2 text-sm font-semibold transition ${
                 activeTab === tab
-                  ? "bg-cyan-500 text-slate-950"
+                  ? tab === "admin" ? "bg-amber-500 text-slate-950" : "bg-cyan-500 text-slate-950"
                   : "text-slate-300 hover:bg-slate-800 hover:text-white"
               }`}
             >
-              {tab === "emt" ? "EMT Dashboard" : "Hospital View"}
+              {tab === "emt" ? "EMT Dashboard" : tab === "hospital" ? "Hospital View" : "Admin"}
             </button>
           ))}
         </nav>
@@ -487,35 +530,71 @@ function App() {
                       Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)
                     </p>
                     <div className="space-y-2 pt-1">
-                      {(route.top3 || []).map((candidate, index) => (
-                        <div key={candidate.id} className="rounded-lg border border-slate-700 bg-slate-900/60 p-2">
-                          <p className="flex items-center gap-2 font-medium text-slate-100">
-                            <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 text-sm font-bold text-cyan-300">{rankLabels[index]}</span>
-                            {candidate.name}
-                          </p>
-                          <p className="mt-1 text-xs text-slate-300">
-                            Distance {candidate.distanceMiles} mi | Capacity {candidate.availableBeds} beds | Util {Math.round(candidate.utilization * 100)}% | Wait {candidate.waitMins} min
-                          </p>
-                          <button
-                            type="button"
-                            onClick={() => handleRequest(candidate)}
-                            disabled={!!sentRequests[candidate.id]}
-                            className={`mt-2 w-full rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-                              sentRequests[candidate.id]
-                                ? "cursor-not-allowed bg-slate-700 text-slate-400"
-                                : "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30"
-                            }`}
+                      {(route.top3 || []).map((candidate, index) => {
+                        const chainEntry = dispatch?.chain?.[index];
+                        const isActive = dispatch?.currentIndex === index;
+                        const wasDispatched = !!chainEntry?.requestStatus;
+                        return (
+                          <div
+                            key={candidate.id}
+                            className={`rounded-lg border p-2 ${isActive ? "border-cyan-500/60 bg-cyan-500/10" : "border-slate-700 bg-slate-900/60"}`}
                           >
-                            {sentRequests[candidate.id] ? "Requested ✓" : "Notify Hospital"}
-                          </button>
-                        </div>
-                      ))}
+                            <p className="flex items-center gap-2 font-medium text-slate-100">
+                              <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 text-sm font-bold text-cyan-300">{rankLabels[index]}</span>
+                              {candidate.name}
+                              {wasDispatched && (
+                                <span className={`ml-auto rounded-full px-2 py-0.5 text-[10px] font-semibold ${dispatchStatusClass(chainEntry.requestStatus)}`}>
+                                  {chainEntry.requestStatus}
+                                </span>
+                              )}
+                            </p>
+                            <p className="mt-1 text-xs text-slate-300">
+                              Distance {candidate.distanceMiles} mi | Capacity {candidate.availableBeds} beds | Util {Math.round(candidate.utilization * 100)}% | Wait {candidate.waitMins} min
+                            </p>
+                          </div>
+                        );
+                      })}
                     </div>
+
+                  {!dispatch ? (
+                    <button
+                      type="button"
+                      onClick={handleDispatch}
+                      className="mt-2 w-full rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
+                    >
+                      Dispatch Patient to #{1} Recommended
+                    </button>
+                  ) : (
+                    <div className={`mt-2 rounded-lg border p-3 text-sm ${dispatchPanelClass(dispatch.status)}`}>
+                      {dispatch.status === "active" && (
+                        <>
+                          <p className="font-semibold">Dispatched → {dispatch.currentHospital?.hospitalName}</p>
+                          <p className="mt-1 text-xs opacity-80">
+                            {dispatch.activeRequest?.autoApproved
+                              ? "Auto-approved — en route"
+                              : dispatch.activeRequest?.status === "pending"
+                              ? "Awaiting hospital confirmation..."
+                              : dispatch.activeRequest?.status}
+                          </p>
+                        </>
+                      )}
+                      {dispatch.status === "accepted" && (
+                        <p className="font-semibold">Confirmed — heading to {dispatch.currentHospital?.hospitalName}</p>
+                      )}
+                      {dispatch.status === "exhausted" && (
+                        <p className="font-semibold">All hospitals diverted — contact dispatch</p>
+                      )}
+                    </div>
+                  )}
                   </div>
                 )}
               </section>
             </aside>
           </section>
+        )}
+
+        {activeTab === "admin" && isAdminMode && (
+          <AdminView hospitals={adminHospitals} onOverride={handleAdminOverride} />
         )}
 
         {activeTab === "hospital" && (
@@ -531,6 +610,65 @@ function App() {
       </section>
     </main>
   );
+}
+
+function AdminView({ hospitals, onOverride }) {
+  const statusOptions = ["Open", "Saturation", "Diversion"];
+  return (
+    <section className="min-h-0 overflow-auto">
+      <div className="mb-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
+        <p className="text-sm font-semibold text-amber-200">Demo Admin — Hospital Status Overrides</p>
+        <p className="mt-1 text-xs text-amber-300/70">Force hospital status to test the diversion chain. Overrides block auto-approve so requests come in as pending and can be manually diverted.</p>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {hospitals.map((h) => (
+          <div key={h.hospitalId} className="rounded-[28px] border border-slate-700 bg-slate-900/60 p-4">
+            <p className="font-semibold text-slate-100">{h.hospitalName}</p>
+            <div className="mt-2 flex flex-wrap gap-2 text-xs text-slate-400">
+              <span>Util {Math.round((h.utilization ?? 0) * 100)}%</span>
+              <span>{h.availableBeds ?? "--"} beds</span>
+              <span>{h.waitMins ?? "--"} min wait</span>
+            </div>
+            <div className="mt-1 flex items-center gap-2 text-xs">
+              <span className="text-slate-400">Auto:</span>
+              <span className={`rounded-full px-2 py-0.5 font-semibold ${statusBadgeColor(h.autoStatus)}`}>{h.autoStatus}</span>
+              {h.override && (
+                <>
+                  <span className="text-slate-500">→ Override:</span>
+                  <span className={`rounded-full px-2 py-0.5 font-semibold ${statusBadgeColor(h.override)}`}>{h.override}</span>
+                </>
+              )}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {statusOptions.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => onOverride(h.hospitalId, h.override === s ? null : s)}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                    h.override === s
+                      ? `${statusBadgeColor(s)} opacity-100`
+                      : "border border-slate-700 bg-slate-800 text-slate-300 hover:border-slate-500"
+                  }`}
+                >
+                  {h.override === s ? `${s} ✓` : s}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function statusBadgeColor(status) {
+  switch (status) {
+    case "Open": return "border border-emerald-500/30 bg-emerald-500/10 text-emerald-200";
+    case "Saturation": return "border border-amber-500/30 bg-amber-500/10 text-amber-200";
+    case "Diversion": return "border border-red-500/30 bg-red-500/10 text-red-200";
+    default: return "border border-slate-700 bg-slate-800 text-slate-300";
+  }
 }
 
 function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFilter, onFilterChange }) {
@@ -569,6 +707,11 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
                   {req.patientSpec && (
                     <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1 text-xs font-semibold uppercase text-cyan-200">
                       {req.patientSpec}
+                    </span>
+                  )}
+                  {req.escalatedFrom && (
+                    <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-200">
+                      Rerouted from {req.escalatedFrom}
                     </span>
                   )}
                   {req.autoApproved && (
@@ -613,6 +756,23 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
       </div>
     </section>
   );
+}
+
+function dispatchStatusClass(status) {
+  switch (status) {
+    case "accepted": return "border border-emerald-500/30 bg-emerald-500/10 text-emerald-200";
+    case "diverted": return "border border-red-500/30 bg-red-500/10 text-red-200";
+    case "pending": return "border border-amber-500/30 bg-amber-500/10 text-amber-200";
+    default: return "border border-slate-700 bg-slate-900 text-slate-300";
+  }
+}
+
+function dispatchPanelClass(status) {
+  switch (status) {
+    case "accepted": return "border-emerald-500/40 bg-emerald-500/10 text-emerald-100";
+    case "exhausted": return "border-red-500/40 bg-red-500/10 text-red-100";
+    default: return "border-cyan-500/40 bg-cyan-500/10 text-cyan-100";
+  }
 }
 
 function requestStatusClass(status) {
