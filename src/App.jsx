@@ -222,15 +222,30 @@ function App() {
 
       const summary = extractPatient(transcript);
       setPatientSummary(summary);
-      if (summary.specification) {
-        setSpecification(summary.specification);
+      if (summary.specification) setSpecification(summary.specification);
+      if (summary.insurance) setInsurance(summary.insurance);
+
+      let geocoded = null;
+      let resolvedOrigin = originRef.current;
+      if (summary.location?.phrase) {
+        geocoded = await geocodeVoiceLocation(summary.location.phrase);
+        if (geocoded) {
+          resolvedOrigin = geocoded.location;
+          setLocationAddress(geocoded.formattedAddress);
+          setResolvedAddress(geocoded.formattedAddress);
+          setLocationError("");
+          await fetchHospitalsByCoords(resolvedOrigin.lat, resolvedOrigin.lng);
+        }
       }
 
-      const reply = buildVoiceReply(summary, originRef.current);
+      const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
       voice.speak(reply);
 
-      if (originRef.current && summary.specification) {
-        await requestRecommendations(originRef.current, summary.specification);
+      if (resolvedOrigin && (summary.specification || geocoded)) {
+        await requestRecommendations(resolvedOrigin, {
+          specification: summary.specification,
+          insurance: summary.insurance,
+        });
       }
     } else {
       setPatientSummary(null);
@@ -238,18 +253,37 @@ function App() {
     }
   }
 
-  async function requestRecommendations(inputOrigin, overrideSpecification) {
+  async function geocodeVoiceLocation(phrase) {
+    try {
+      const res = await fetch("/api/geocode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: phrase }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.location) return null;
+      return {
+        formattedAddress: data.formattedAddress ?? phrase,
+        location: data.location,
+      };
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  async function requestRecommendations(inputOrigin, overrides = {}) {
     setOrigin(inputOrigin);
     setSentRequests({});
     setDispatch(null);
-    const effectiveSpecification = overrideSpecification ?? specification;
+    const effectiveSpecification = overrides.specification ?? specification;
+    const effectiveInsurance = overrides.insurance ?? insurance;
     const res = await fetch("/api/route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         origin: inputOrigin,
         specification: effectiveSpecification || null,
-        insurance: insurance || null,
+        insurance: effectiveInsurance || null,
       }),
     });
     const data = await res.json();
@@ -523,6 +557,12 @@ function App() {
                     {patientSummary.specification && (
                       <p>Suspected: <span className="font-semibold text-white">{patientSummary.specification.toUpperCase()}</span></p>
                     )}
+                    {patientSummary.insurance && (
+                      <p>Insurance: <span className="font-semibold text-white">{patientSummary.insurance}</span></p>
+                    )}
+                    {patientSummary.location?.phrase && (
+                      <p>Location heard: <span className="font-semibold text-white">{patientSummary.location.phrase}</span></p>
+                    )}
                     {(patientSummary.age || patientSummary.sex) && (
                       <p>Demographics: {[patientSummary.age && `${patientSummary.age}y`, patientSummary.sex].filter(Boolean).join(", ")}</p>
                     )}
@@ -708,7 +748,7 @@ function App() {
   );
 }
 
-function buildVoiceReply(summary, hasOrigin) {
+function buildVoiceReply(summary, resolvedOrigin, geocoded) {
   const specLabels = { stemi: "STEMI", stroke: "stroke", trauma: "trauma" };
   const parts = [];
 
@@ -718,12 +758,22 @@ function buildVoiceReply(summary, hasOrigin) {
     parts.push("Got it.");
   }
 
-  if (hasOrigin && summary.specification) {
+  if (summary.insurance) {
+    parts.push(`Insurance noted as ${summary.insurance}.`);
+  }
+
+  if (geocoded) {
+    parts.push(`Pinned location at ${geocoded.formattedAddress}.`);
+  } else if (summary.location?.phrase && !geocoded) {
+    parts.push(`I couldn't pin "${summary.location.phrase}" on the map. Confirm the address.`);
+  }
+
+  if (resolvedOrigin && summary.specification) {
     parts.push(`Routing to the closest ${specLabels[summary.specification]}-capable hospital now.`);
-  } else if (!hasOrigin) {
-    parts.push("Set the patient's location to compute the route.");
+  } else if (resolvedOrigin) {
+    parts.push("Computing the route now.");
   } else {
-    parts.push("Tell me the suspected condition or set a location to start routing.");
+    parts.push("Set the patient's location to compute the route.");
   }
 
   return parts.join(" ");
