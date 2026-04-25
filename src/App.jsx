@@ -13,6 +13,7 @@ import { extractPatient } from "./lib/extractPatient.js";
 import logo from "./assets/logo_nobkg.png";
 
 const isAdminMode = new URLSearchParams(window.location.search).has("admin");
+const isHospitalPage = window.location.pathname.replace(/\/$/, "") === "/hospital";
 const centerGL = { lat: 34.0522, lng: -118.2437 };
 const defaultZoom = 11;
 const mapContainerStyle = { width: "100%", height: "100%" };
@@ -48,7 +49,7 @@ function App() {
   const [resolvedAddress, setResolvedAddress] = useState("");
   const [locationError, setLocationError] = useState("");
   const [insurance, setInsurance] = useState("");
-  const [activeTab, setActiveTab] = useState("emt");
+  const [activeTab, setActiveTab] = useState(isHospitalPage ? "hospital" : "emt");
   const [hospitalRequests, setHospitalRequests] = useState([]);
   const [sentRequests, setSentRequests] = useState({}); // { [hospitalId]: requestId }
   const [selectedHospitalFilter, setSelectedHospitalFilter] = useState("");
@@ -146,9 +147,9 @@ function App() {
     });
   }
 
-  // Poll hospital requests while on hospital tab
+  // Poll hospital requests when on hospital page or tab
   useEffect(() => {
-    if (activeTab !== "hospital") return;
+    if (!isHospitalPage && activeTab !== "hospital") return;
     fetchHospitalRequests();
     const iv = setInterval(fetchHospitalRequests, 3500);
     return () => clearInterval(iv);
@@ -552,7 +553,9 @@ function App() {
     return <main className="screen bg-grid p-8 text-red-300">Failed to load Google Maps: {loadError.message}</main>;
   }
 
-  const tabs = ["emt", "hospital", ...(isAdminMode ? ["admin"] : [])];
+  const tabs = isHospitalPage
+    ? ["hospital"]
+    : ["emt", ...(isAdminMode ? ["admin"] : [])];
 
   return (
     <main className="screen bg-grid text-slate-100">
@@ -565,20 +568,22 @@ function App() {
           </div>
         </header>
 
-        <nav className="flex gap-1 rounded-xl border border-slate-700 bg-slate-950/70 p-1">
-          {tabs.map((tab) => (
-            <button
-              key={tab}
-              type="button"
-              onClick={() => setActiveTab(tab)}
-              className={`flex-1 rounded-lg px-4 py-2 text-sm font-semibold transition ${
-                activeTab === tab ? "bg-cyan-500 text-slate-950" : "text-slate-300 hover:bg-slate-800"
-              }`}
-            >
-              {tab === "emt" ? "EMT View" : tab === "hospital" ? "Hospital View" : "Admin"}
-            </button>
-          ))}
-        </nav>
+        {tabs.length > 1 && (
+          <nav className="flex gap-1 rounded-xl border border-slate-700 bg-slate-950/70 p-1">
+            {tabs.map((tab) => (
+              <button
+                key={tab}
+                type="button"
+                onClick={() => setActiveTab(tab)}
+                className={`flex-1 rounded-lg px-4 py-2 text-sm font-semibold transition ${
+                  activeTab === tab ? "bg-cyan-500 text-slate-950" : "text-slate-300 hover:bg-slate-800"
+                }`}
+              >
+                {tab === "emt" ? "EMT View" : tab === "hospital" ? "Hospital View" : "Admin"}
+              </button>
+            ))}
+          </nav>
+        )}
 
         {activeTab === "emt" && (
           <section className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[2fr_1fr]">
@@ -1060,8 +1065,8 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
       </div>
       <div className="min-h-0 overflow-auto">
         {requests.length === 0 ? (
-          <div className="flex h-full items-center justify-center rounded-xl border border-slate-700 bg-slate-950/70">
-            <p className="text-sm text-slate-400">No incoming requests{selectedHospitalFilter ? " for this hospital" : ""}.</p>
+          <div className="flex h-64 items-center justify-center rounded-xl border border-slate-700 bg-slate-950/70">
+            <p className="text-base text-slate-400">No incoming requests{selectedHospitalFilter ? " for this hospital" : ""}.</p>
           </div>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
