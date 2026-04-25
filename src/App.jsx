@@ -318,19 +318,19 @@ function App() {
         }
       }
 
-      if (resolvedOrigin && geocoded) {
+      const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
+
+      if (resolvedOrigin) {
         const routeData = await requestRecommendations(resolvedOrigin, { insurance: summary.insurance });
-        const dispatchData = await autoDispatch(routeData);
+        const dispatchData = await autoDispatch(routeData, summary.insurance);
         const hospital = dispatchData?.currentHospital;
         const req = dispatchData?.activeRequest;
         const eta = hospital?.etaMins ?? "unknown";
         const statusPhrase = req?.autoApproved
           ? "Auto-approved. En route."
           : "Awaiting hospital confirmation.";
-        const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
         voice.speak(`${reply} Dispatching to ${hospital?.hospitalName ?? "top hospital"}, ${eta} minutes away. ${statusPhrase}`);
       } else {
-        const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
         voice.speak(reply);
       }
     } else {
@@ -381,7 +381,7 @@ function App() {
     return data;
   }
 
-  async function autoDispatch(routeData) {
+  async function autoDispatch(routeData, effectiveInsurance) {
     if (!routeData?.top3?.length) return null;
     const chain = routeData.top3.map((c) => ({
       hospitalId: c.id,
@@ -394,7 +394,7 @@ function App() {
     const res = await fetch("/api/dispatch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chain, insurance: insurance || null }),
+      body: JSON.stringify({ chain, insurance: effectiveInsurance || insurance || null }),
     });
     if (!res.ok) return null;
     const dispatchMeta = await res.json();
