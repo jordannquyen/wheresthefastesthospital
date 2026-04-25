@@ -10,6 +10,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "reset:patients": "node scripts/resetPatients.js",
     "start": "node server/index.js"
   },
   "dependencies": {

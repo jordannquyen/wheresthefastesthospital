@@ -13,12 +13,29 @@ import { extractPatient } from "./lib/extractPatient.js";
 import logo from "./assets/logo_nobkg.png";
 
 const isAdminMode = new URLSearchParams(window.location.search).has("admin");
-const centerGL = { lat: 20, lng: 0 };
-const defaultZoom = 2;
+const centerGL = { lat: 34.0522, lng: -118.2437 };
+const defaultZoom = 11;
 const mapContainerStyle = { width: "100%", height: "100%" };
 const mapsApiKey = import.meta.env.GOOGLE_MAPS_API_KEY;
 const mapsLibraries = ["places"];
 const rankLabels = ["1", "2", "3"];
+
+function buildPickedOverDiff(a, b) {
+  if (!a || !b) return "";
+  const parts = [];
+
+  if (a.durationMins != null && b.durationMins != null && b.durationMins > 0) {
+    const pct = Math.round(((b.durationMins - a.durationMins) / b.durationMins) * 100);
+    if (pct >= 10) parts.push(`${pct}% lower ETA`);
+  }
+
+  if (a.availableBeds != null && b.availableBeds != null) {
+    const delta = a.availableBeds - b.availableBeds;
+    if (delta >= 3) parts.push(`${delta} more open beds`);
+  }
+
+  return parts.join(", ");
+}
 
 function App() {
   const [nodes, setNodes] = useState([]);
@@ -41,6 +58,7 @@ function App() {
   const [adminHospitals, setAdminHospitals] = useState([]);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [patientSummary, setPatientSummary] = useState(null);
+  const [currentPatientId, setCurrentPatientId] = useState(null);
   const [editingLocation, setEditingLocation] = useState(false);
   const [locationDraft, setLocationDraft] = useState("");
   const mapRef = useRef(null);
@@ -211,8 +229,14 @@ function App() {
   }
 
   async function fetchHospitalRequests() {
-    const params = selectedHospitalFilter ? `?hospitalId=${selectedHospitalFilter}` : "";
-    const res = await fetch(`/api/requests${params}`);
+    if (selectedHospitalFilter) {
+      const res = await fetch(`/api/hospitals/${selectedHospitalFilter}/incoming-patients`);
+      const data = await res.json();
+      setHospitalRequests((data.patients ?? []).map(patientToRequestCard));
+      return;
+    }
+
+    const res = await fetch("/api/requests");
     const data = await res.json();
     setHospitalRequests(data.requests ?? []);
   }
@@ -260,8 +284,24 @@ function App() {
     }
   }
 
-  async function handleRequestAction(requestId, status) {
-    await fetch(`/api/requests/${requestId}`, {
+  async function handleRequestAction(request, status) {
+    if (request.source === "patient") {
+      if (status === "accepted") {
+        await fetch(`/api/patients/${request.patientId}/accept`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            hospitalId: request.hospitalId,
+            hospitalName: request.hospitalName,
+            etaMinutes: request.etaMins,
+          }),
+        });
+      }
+      fetchHospitalRequests();
+      return;
+    }
+
+    await fetch(`/api/requests/${request.requestId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
@@ -352,8 +392,7 @@ function App() {
       } catch {
         summary = extractPatient(transcript);
       }
-      setPatientSummary(summary);
-      if (summary.insurance) setInsurance(summary.insurance);
+      if (summary.insuranceProvider) setInsurance(summary.insuranceProvider);
 
       let geocoded = null;
       let resolvedOrigin = originRef.current;
@@ -370,8 +409,8 @@ function App() {
         if (resolvedOrigin) await fetchHospitalsByCoords(resolvedOrigin.lat, resolvedOrigin.lng);
       }
 
-      if (summary.location?.phrase) {
-        geocoded = await geocodeVoiceLocation(summary.location.phrase);
+      if (summary.address) {
+        geocoded = await geocodeVoiceLocation(summary.address);
         if (geocoded) {
           resolvedOrigin = geocoded.location;
           setLocationAddress(geocoded.formattedAddress);
@@ -381,11 +420,28 @@ function App() {
         }
       }
 
+      const patientPayload = {
+        ...summary,
+        latitude: resolvedOrigin?.lat,
+        longitude: resolvedOrigin?.lng,
+        address: geocoded?.formattedAddress ?? summary.address ?? resolvedAddress,
+      };
+      const patient = currentPatientId
+        ? await updatePatientFromVoice(currentPatientId, patientPayload)
+        : await createPatientFromIntake(patientPayload);
+      if (patient?.patientId) {
+        setCurrentPatientId(patient.patientId);
+        setPatientSummary(patient);
+        summary = patient;
+      } else {
+        setPatientSummary(summary);
+      }
+
       const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
 
       if (resolvedOrigin) {
-        const routeData = await requestRecommendations(resolvedOrigin, { insurance: summary.insurance });
-        const dispatchData = await autoDispatch(routeData, summary.insurance, summary);
+        const routeData = await requestRecommendations(resolvedOrigin, { insurance: summary.insuranceProvider, patientId: summary.patientId });
+        const dispatchData = await autoDispatch(routeData, summary.insuranceProvider, summary);
         const hospital = dispatchData?.currentHospital;
         const req = dispatchData?.activeRequest;
         const eta = hospital?.etaMins ?? "unknown";
@@ -397,7 +453,6 @@ function App() {
         voice.speak(reply);
       }
     } else {
-      setPatientSummary(null);
       await voice.start();
     }
   }
@@ -435,6 +490,9 @@ function App() {
     });
     const data = await res.json();
     setRoute(data);
+    if (overrides.patientId && data.recommended) {
+      await saveRouteRecommendation(overrides.patientId, data.recommended);
+    }
     setProvider(data.provider ?? "fallback");
     if (data.insurance && !data.insuranceMatchFound) {
       setLocationError(
@@ -457,7 +515,12 @@ function App() {
     const res = await fetch("/api/dispatch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chain, insurance: effectiveInsurance || insurance || null, patientSummary: summaryData ?? null }),
+      body: JSON.stringify({
+        chain,
+        insurance: effectiveInsurance || insurance || null,
+        patientId: summaryData?.patientId ?? currentPatientId,
+        patientSummary: summaryData ?? null,
+      }),
     });
     if (!res.ok) return null;
     const dispatchMeta = await res.json();
@@ -529,27 +592,6 @@ function App() {
                   onLoad={(map) => { mapRef.current = map; }}
                   onClick={handleMapClick}
                 >
-                  {nodes.map((node) => {
-                    const util = nodeUtilization(node);
-                    const color = getNodeColor(util);
-                    const congested = util >= 0.97;
-                    return (
-                      <Circle
-                        key={`circle-${node.id}`}
-                        center={{ lat: node.lat, lng: node.lng }}
-                        radius={congested ? 1350 : 960}
-                        options={{
-                          fillColor: color,
-                          fillOpacity: congested ? 0.46 : 0.26,
-                          strokeColor: color,
-                          strokeOpacity: 0.85,
-                          strokeWeight: congested ? 2.5 : 1.4,
-                          clickable: true,
-                        }}
-                        onClick={() => setSelectedHospitalId(node.id)}
-                      />
-                    );
-                  })}
 
                   {nodes.map((node) => {
                     const util = nodeUtilization(node);
@@ -561,7 +603,7 @@ function App() {
                         onClick={() => setSelectedHospitalId(node.id)}
                         icon={{
                           path: window.google.maps.SymbolPath.CIRCLE,
-                          scale: util >= 0.97 && pulseTick ? 10 : 8,
+                          scale: 8,
                           fillColor: getNodeColor(util),
                           fillOpacity: 1,
                           strokeColor: "#e2e8f0",
@@ -658,8 +700,8 @@ function App() {
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-200">Legend</p>
                 <ul className="mt-2 space-y-1.5 text-xs text-slate-300">
                   <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" />Green: &lt;70% util</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 70-96% util</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500" />Red pulse: 97%+ util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 70–96% util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500" />Red: 97%+ util</li>
                   <li><span className="mr-2 inline-block h-[2px] w-6 bg-sky-400 align-middle" />Top recommendation</li>
                   <li><span className="mr-2 inline-block h-[2px] w-6 border-b border-dashed border-slate-400 align-middle" />Closest baseline</li>
                 </ul>
@@ -682,7 +724,11 @@ function App() {
                     voice.isListening
                       ? "bg-red-500 text-white hover:bg-red-400"
                       : "bg-cyan-500 text-slate-950 hover:bg-cyan-400"
-                  } ${(!voiceEnabled || voice.isProcessing) ? "cursor-not-allowed opacity-60" : ""}`}
+                  } ${(!voiceEnabled || voice.isProcessing) ? "cursor-not-allowed opacity-60" : ""} ${
+                    !route && !voice.isListening && !voice.isProcessing && !voice.isSpeaking && voiceEnabled
+                      ? "ring-2 ring-cyan-400/60 animate-pulse"
+                      : ""
+                  }`}
                 >
                   <span className={`inline-block h-2.5 w-2.5 rounded-full ${voice.isListening ? "animate-pulse bg-white" : "bg-slate-950/60"}`} />
                   {voice.isListening
@@ -726,22 +772,20 @@ function App() {
                         <p>Demographics: {[patientSummary.age && `${patientSummary.age}y`, patientSummary.sex].filter(Boolean).join(", ")}</p>
                       )}
                       {patientSummary.chiefComplaint && <p>Complaint: <span className="font-semibold text-white">{patientSummary.chiefComplaint}</span></p>}
-                      {patientSummary.specification && <p>Suspected: <span className="font-semibold text-white">{patientSummary.specification.toUpperCase()}</span></p>}
-                      {patientSummary.mechanism && <p>Mechanism: <span className="font-semibold text-white">{patientSummary.mechanism}</span></p>}
-                      {patientSummary.insurance && <p>Insurance: <span className="font-semibold text-white">{patientSummary.insurance}</span></p>}
-                      {patientSummary.location?.phrase && <p>Location heard: <span className="font-semibold text-white">{patientSummary.location.phrase}</span></p>}
-                      {(patientSummary.vitals?.bp || patientSummary.vitals?.hr || patientSummary.vitals?.spo2 || patientSummary.vitals?.rr) && (
+                      {patientSummary.condition && <p>Condition: <span className="font-semibold text-white">{patientSummary.condition.toUpperCase()}</span></p>}
+                      {patientSummary.severity && <p>Severity: <span className="font-semibold text-white">{patientSummary.severity}</span></p>}
+                      {patientSummary.insuranceProvider && <p>Insurance: <span className="font-semibold text-white">{patientSummary.insuranceProvider}</span></p>}
+                      {patientSummary.address && <p>Location heard: <span className="font-semibold text-white">{patientSummary.address}</span></p>}
+                      {(patientSummary.bloodPressure || patientSummary.heartRate || patientSummary.oxygenSaturation || patientSummary.respiratoryRate) && (
                         <p>Vitals: {[
-                          patientSummary.vitals.bp && `BP ${patientSummary.vitals.bp}`,
-                          patientSummary.vitals.hr && `HR ${patientSummary.vitals.hr}`,
-                          patientSummary.vitals.spo2 && `SpO₂ ${patientSummary.vitals.spo2}%`,
-                          patientSummary.vitals.rr && `RR ${patientSummary.vitals.rr}`,
+                          patientSummary.bloodPressure && `BP ${patientSummary.bloodPressure}`,
+                          patientSummary.heartRate && `HR ${patientSummary.heartRate}`,
+                          patientSummary.oxygenSaturation && `SpO₂ ${patientSummary.oxygenSaturation}%`,
+                          patientSummary.respiratoryRate && `RR ${patientSummary.respiratoryRate}`,
                         ].filter(Boolean).join(" · ")}</p>
                       )}
-                      {patientSummary.mentalStatus && <p>Mental status: <span className="font-semibold text-white">{patientSummary.mentalStatus}</span></p>}
-                      {patientSummary.interventions?.length > 0 && (
-                        <p>Interventions: <span className="font-semibold text-white">{patientSummary.interventions.join(", ")}</span></p>
-                      )}
+                      {patientSummary.summary && <p>Summary: <span className="font-semibold text-white">{patientSummary.summary}</span></p>}
+                      {patientSummary.confidence != null && <p>Confidence: <span className="font-semibold text-white">{Math.round(patientSummary.confidence * 100)}%</span></p>}
                     </div>
                   </div>
                 )}
@@ -774,7 +818,7 @@ function App() {
 
               <section className="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4">
                 <h2 className="text-lg font-semibold">Top 3 Hospital Choices</h2>
-                {!route && <p className="mt-2 text-sm text-slate-300">Enter a location to get ranked recommendations.</p>}
+                {!route && <p className="mt-2 text-sm text-slate-300">Click anywhere on the map, type an address, or tap the mic to start.</p>}
                 {route && (
                   <div className="mt-2 space-y-3 text-sm">
                     <p className="rounded-md border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
@@ -803,6 +847,11 @@ function App() {
                           <p className="mt-1 text-xs text-slate-300">
                             {candidate.distanceMiles} mi ({candidate.durationMins} min) | {candidate.availableBeds} beds avail ({Math.round(candidate.utilization * 100)}% util) | {candidate.waitMins} min wait
                           </p>
+                          {index === 0 && route.top3[1] && buildPickedOverDiff(route.top3[0], route.top3[1]) && (
+                            <p className="mt-1 text-[11px] italic text-cyan-300/80">
+                              Picked over {route.top3[1].name}: {buildPickedOverDiff(route.top3[0], route.top3[1])}
+                            </p>
+                          )}
                         </div>
                         );
                       })}
@@ -849,8 +898,8 @@ function App() {
           <HospitalView
             nodes={nodes}
             requests={hospitalRequests}
-            onAccept={(id) => handleRequestAction(id, "accepted")}
-            onDivert={(id) => handleRequestAction(id, "diverted")}
+            onAccept={(request) => handleRequestAction(request, "accepted")}
+            onDivert={(request) => handleRequestAction(request, "diverted")}
             selectedHospitalFilter={selectedHospitalFilter}
             onFilterChange={setSelectedHospitalFilter}
           />
@@ -865,23 +914,22 @@ function App() {
 }
 
 function buildVoiceReply(summary, resolvedOrigin, geocoded) {
-  const specLabels = { stemi: "STEMI", stroke: "stroke", trauma: "trauma" };
   const parts = [];
 
-  if (summary.specification) {
-    parts.push(`Heard ${specLabels[summary.specification]} symptoms.`);
+  if (summary.condition) {
+    parts.push(`Heard possible ${summary.condition} emergency.`);
   } else {
     parts.push("Got it.");
   }
 
-  if (summary.insurance) {
-    parts.push(`Insurance noted as ${summary.insurance}.`);
+  if (summary.insuranceProvider) {
+    parts.push(`Insurance noted as ${summary.insuranceProvider}.`);
   }
 
   if (geocoded) {
     parts.push(`Pinned location at ${geocoded.formattedAddress}.`);
-  } else if (summary.location?.phrase && !geocoded) {
-    parts.push(`I couldn't pin "${summary.location.phrase}" on the map. Confirm the address.`);
+  } else if (summary.address && !geocoded) {
+    parts.push(`I couldn't pin "${summary.address}" on the map. Confirm the address.`);
   }
 
   if (resolvedOrigin) {
@@ -891,6 +939,64 @@ function buildVoiceReply(summary, resolvedOrigin, geocoded) {
   }
 
   return parts.join(" ");
+}
+
+async function createPatientFromIntake(payload) {
+  try {
+    const res = await fetch("/api/patients/intake", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    return res.ok ? data.patient : null;
+  } catch {
+    return null;
+  }
+}
+
+async function updatePatientFromVoice(patientId, payload) {
+  try {
+    const res = await fetch(`/api/patients/${patientId}/voice-update`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    return res.ok ? data.patient : null;
+  } catch {
+    return null;
+  }
+}
+
+async function saveRouteRecommendation(patientId, recommended) {
+  try {
+    await fetch(`/api/patients/${patientId}/route`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        recommendedHospitalId: recommended.id,
+        recommendedHospitalName: recommended.name,
+        etaMinutes: recommended.durationMins,
+        routingReason: "Best ranked hospital based on ETA, wait time, capacity, and status.",
+      }),
+    });
+  } catch { /* non-blocking */ }
+}
+
+function patientToRequestCard(patient) {
+  return {
+    source: "patient",
+    requestId: patient.patientId,
+    patientId: patient.patientId,
+    hospitalId: patient.assignedHospitalId ?? patient.recommendedHospitalId,
+    hospitalName: patient.assignedHospitalName ?? patient.recommendedHospitalName,
+    status: patient.status === "accepted" ? "accepted" : "pending",
+    insurance: patient.insuranceProvider,
+    patientSummary: patient,
+    etaMins: patient.etaMinutes,
+    requestedAt: patient.updatedAt ?? patient.createdAt ?? new Date().toISOString(),
+  };
 }
 
 function AdminView({ hospitals, onOverride }) {
@@ -983,8 +1089,10 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
                 </div>
                 {req.status === "pending" && (
                   <div className="mt-4 flex gap-2">
-                    <button type="button" onClick={() => onAccept(req.requestId)} className="flex-1 rounded-md bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30">Accept</button>
-                    <button type="button" onClick={() => onDivert(req.requestId)} className="flex-1 rounded-md bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/30">Divert</button>
+                    <button type="button" onClick={() => onAccept(req)} className="flex-1 rounded-md bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30">Accept</button>
+                    {req.source !== "patient" && (
+                      <button type="button" onClick={() => onDivert(req)} className="flex-1 rounded-md bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/30">Divert</button>
+                    )}
                   </div>
                 )}
               </div>
@@ -1023,51 +1131,43 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
                   )}
                 </div>
               )}
-              {(reportReq.patientSummary?.chiefComplaint || reportReq.patientSummary?.specification) && (
+              {(reportReq.patientSummary?.chiefComplaint || reportReq.patientSummary?.condition) && (
                 <div>
                   <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Chief Complaint</p>
-                  <p className="text-slate-100">{reportReq.patientSummary.chiefComplaint ?? reportReq.patientSummary.specification?.toUpperCase()}</p>
+                  <p className="text-slate-100">{reportReq.patientSummary.chiefComplaint ?? reportReq.patientSummary.condition?.toUpperCase()}</p>
                 </div>
               )}
-              {reportReq.patientSummary?.mechanism && (
+              {reportReq.patientSummary?.severity && (
                 <div>
-                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Mechanism of Injury / Illness</p>
-                  <p className="text-slate-100">{reportReq.patientSummary.mechanism}</p>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Severity</p>
+                  <p className="text-slate-100">{reportReq.patientSummary.severity}</p>
                 </div>
               )}
-              {(reportReq.patientSummary?.vitals?.bp || reportReq.patientSummary?.vitals?.hr || reportReq.patientSummary?.vitals?.spo2 || reportReq.patientSummary?.vitals?.rr) && (
+              {(reportReq.patientSummary?.bloodPressure || reportReq.patientSummary?.heartRate || reportReq.patientSummary?.oxygenSaturation || reportReq.patientSummary?.respiratoryRate) && (
                 <div>
                   <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Vital Signs</p>
                   <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-slate-100">
-                    {reportReq.patientSummary.vitals.bp && <p>BP <span className="font-medium text-white">{reportReq.patientSummary.vitals.bp}</span></p>}
-                    {reportReq.patientSummary.vitals.hr && <p>HR <span className="font-medium text-white">{reportReq.patientSummary.vitals.hr} bpm</span></p>}
-                    {reportReq.patientSummary.vitals.spo2 && <p>SpO₂ <span className="font-medium text-white">{reportReq.patientSummary.vitals.spo2}%</span></p>}
-                    {reportReq.patientSummary.vitals.rr && <p>RR <span className="font-medium text-white">{reportReq.patientSummary.vitals.rr}/min</span></p>}
+                    {reportReq.patientSummary.bloodPressure && <p>BP <span className="font-medium text-white">{reportReq.patientSummary.bloodPressure}</span></p>}
+                    {reportReq.patientSummary.heartRate && <p>HR <span className="font-medium text-white">{reportReq.patientSummary.heartRate} bpm</span></p>}
+                    {reportReq.patientSummary.oxygenSaturation && <p>SpO₂ <span className="font-medium text-white">{reportReq.patientSummary.oxygenSaturation}%</span></p>}
+                    {reportReq.patientSummary.respiratoryRate && <p>RR <span className="font-medium text-white">{reportReq.patientSummary.respiratoryRate}/min</span></p>}
                   </div>
                 </div>
               )}
-              {reportReq.patientSummary?.mentalStatus && (
+              {reportReq.patientSummary?.summary && (
                 <div>
-                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Mental Status</p>
-                  <p className="text-slate-100">{reportReq.patientSummary.mentalStatus}</p>
-                </div>
-              )}
-              {reportReq.patientSummary?.interventions?.length > 0 && (
-                <div>
-                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Interventions & Response</p>
-                  <ul className="list-inside list-disc space-y-0.5 text-slate-100">
-                    {reportReq.patientSummary.interventions.map((i) => <li key={i}>{i}</li>)}
-                  </ul>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Summary</p>
+                  <p className="text-slate-100">{reportReq.patientSummary.summary}</p>
                 </div>
               )}
               <div>
                 <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">ETA</p>
                 <p className="text-slate-100">{reportReq.etaMins != null ? `${reportReq.etaMins} min` : "—"}</p>
               </div>
-              {reportReq.insurance && (
+              {(reportReq.insurance || reportReq.patientSummary?.insuranceProvider) && (
                 <div>
                   <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Insurance</p>
-                  <p className="text-slate-100">{reportReq.insurance}</p>
+                  <p className="text-slate-100">{reportReq.insurance ?? reportReq.patientSummary.insuranceProvider}</p>
                 </div>
               )}
               {!reportReq.patientSummary && (
