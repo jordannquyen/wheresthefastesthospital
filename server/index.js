@@ -840,7 +840,7 @@ async function computeRoute(origin, insurance) {
     origin,
     insurance: normalizedInsurance,
     insuranceMatchFound,
-    model: "score = status / (ETA² + waitMins)",
+    model: "cost = ETA + waitMins + statusPenalty(Open=0,Sat=0,Div=3)",
     closest,
     recommended,
     top3,
@@ -919,13 +919,14 @@ function deriveStatus(utilization) {
 }
 
 function scoreHospital(node) {
-  const STATUS_MULTIPLIER = { Open: 1.0, Saturation: 0.5, Diversion: 0 };
+  // Lower cost = better. Total time (ETA + waitMins) is primary;
+  // status adds a flat minute-equivalent penalty so red hospitals lose to
+  // equivalently-close green ones but aren't excluded entirely.
+  const STATUS_PENALTY = { Open: 0, Saturation: 0, Diversion: 3 };
   const eta = node.durationMins || 1;
-  const waitMins = node.waitMins || 1;
-  const status = STATUS_MULTIPLIER[node.status] ?? 1.0;
-  // ETA² dominates: 2× farther → 4× penalty. Status (which encodes bed availability
-  // via utilization) breaks ties. waitMins is the final tiebreaker.
-  return status / (eta ** 2 + waitMins);
+  const waitMins = node.waitMins || 0;
+  const penalty = STATUS_PENALTY[node.status] ?? 0;
+  return -(eta + waitMins + penalty);
 }
 
 function normalizeInsurance(input) {
