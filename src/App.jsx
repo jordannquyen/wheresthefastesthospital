@@ -10,11 +10,19 @@ import {
 } from "@react-google-maps/api";
 import { useVoice } from "./hooks/useVoice.js";
 import { extractPatient } from "./lib/extractPatient.js";
+import { apiFetch } from "./lib/api.js";
+import { useAuth } from "./lib/auth.jsx";
+import { LoginScreen } from "./components/LoginScreen.jsx";
+import { RoleMismatchScreen } from "./components/RoleMismatchScreen.jsx";
 import logo from "./assets/logo_nobkg.png";
 
 const isAdminMode = new URLSearchParams(window.location.search).has("admin");
 const appPath = window.location.pathname.replace(/\/$/, "") || "/";
 const isHospitalPage = appPath === "/hospital";
+const isEmtPage = appPath === "/emt";
+const isLoginPage = appPath === "/login";
+const isLandingPage = appPath === "/" && !isAdminMode;
+const pageRole = isAdminMode ? "admin" : isHospitalPage ? "hospital" : isEmtPage ? "emt" : null;
 const centerGL = { lat: 34.0522, lng: -118.2437 };
 const defaultZoom = 11;
 const mapContainerStyle = { width: "100%", height: "100%" };
@@ -40,11 +48,41 @@ function buildPickedOverDiff(a, b) {
 }
 
 function App() {
-  if (appPath === "/") return <LandingPage />;
-  return <OperationalApp />;
+  if (isLandingPage) return <LandingPage />;
+  if (isLoginPage) return <LoginRoute />;
+  return <AuthGate />;
+}
+
+function AuthGate() {
+  const { user, loading: authLoading } = useAuth();
+  if (authLoading) return <FullscreenSpinner />;
+  if (!user) return <LoginScreen pageRole={pageRole ?? "emt"} />;
+  if (user.role !== pageRole) return <RoleMismatchScreen current={user.role} needed={pageRole} />;
+  return <AuthenticatedApp user={user} />;
+}
+
+function LoginRoute() {
+  const { user, loading: authLoading } = useAuth();
+  // Already signed in? Send them straight to their console.
+  useEffect(() => {
+    if (!authLoading && user) {
+      window.location.replace(ROLE_HOME[user.role] ?? "/");
+    }
+  }, [authLoading, user]);
+  if (authLoading || user) return <FullscreenSpinner />;
+  return <LoginScreen pageRole={null} />;
+}
+
+function FullscreenSpinner() {
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-slate-950 text-slate-400">
+      <div className="font-mono text-xs uppercase tracking-[0.22em]">Loading…</div>
+    </div>
+  );
 }
 
 function LandingPage() {
+  const { user, logout } = useAuth();
   return (
     <main className="screen bg-grid text-slate-100">
       <section className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-5 py-5 sm:px-8 lg:px-10">
@@ -54,6 +92,7 @@ function LandingPage() {
             <span className="text-lg font-bold tracking-tight">wtf-hospital</span>
             <span className="text-sm text-slate-400">(Where's The Fastest Hospital?)</span>
           </a>
+          <LandingAuthBadge user={user} onLogout={logout} />
         </header>
 
         <div className="grid flex-1 items-center gap-8 py-10 lg:grid-cols-[1.05fr_0.95fr] lg:py-12">
@@ -66,13 +105,18 @@ function LandingPage() {
               Turn EMT voice reports into structured patient records, rank nearby hospitals by capacity and ETA, and give receiving teams a live incoming-patient queue.
             </p>
             <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-              <a href="/emt" className="inline-flex items-center justify-center rounded-md bg-cyan-400 px-5 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition hover:bg-cyan-300">
-                Open EMT Side
-              </a>
-              <a href="/hospital" className="inline-flex items-center justify-center rounded-md border border-slate-500 bg-slate-900/60 px-5 py-3 text-sm font-bold text-slate-100 transition hover:border-cyan-300 hover:bg-slate-800">
-                Open Hospital Side
+              <a
+                href={user ? (ROLE_HOME[user.role] ?? "/login") : "/login"}
+                className="inline-flex items-center justify-center rounded-md bg-cyan-400 px-6 py-3 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-500/20 transition hover:bg-cyan-300"
+              >
+                Explore
               </a>
             </div>
+            <p className="mt-4 text-xs text-slate-400">
+              {user
+                ? `Signed in as ${user.displayName ?? user.username}. Explore opens your ${user.role === "hospital" ? "hospital" : user.role === "admin" ? "admin" : "EMT"} console.`
+                : "Sign in or create an account to access the EMT or hospital console."}
+            </p>
           </section>
 
           <section className="overflow-hidden rounded-xl border border-slate-700 bg-slate-950/70 shadow-2xl shadow-black/40">
@@ -104,7 +148,48 @@ function LandingPage() {
   );
 }
 
-function OperationalApp() {
+const ROLE_HOME = { emt: "/emt", hospital: "/hospital", admin: "/?admin=true" };
+
+function LandingAuthBadge({ user, onLogout }) {
+  if (!user) {
+    return (
+      <div className="flex items-center gap-2">
+        <a
+          href="/login"
+          className="rounded-md border border-slate-600 bg-slate-900 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-slate-800"
+        >
+          Sign in
+        </a>
+      </div>
+    );
+  }
+  return (
+    <div className="flex items-center gap-3 text-right">
+      <div className="hidden text-xs sm:block">
+        <p className="font-semibold text-slate-100">{user.displayName ?? user.username}</p>
+        <p className="text-[11px] uppercase tracking-wide text-slate-400">
+          {user.role === "hospital" ? user.hospitalName ?? "Hospital" : user.role === "admin" ? "Admin" : "EMT"}
+        </p>
+      </div>
+      <a
+        href={ROLE_HOME[user.role] ?? "/"}
+        className="rounded-md bg-cyan-500 px-3 py-1.5 text-xs font-semibold text-slate-950 transition hover:bg-cyan-400"
+      >
+        Open console
+      </a>
+      <button
+        type="button"
+        onClick={onLogout}
+        className="rounded-md border border-slate-600 bg-slate-900 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-slate-800"
+      >
+        Log out
+      </button>
+    </div>
+  );
+}
+
+function AuthenticatedApp({ user }) {
+  const { logout } = useAuth();
   const [nodes, setNodes] = useState([]);
   const [origin, setOrigin] = useState(null);
   const [route, setRoute] = useState(null);
@@ -115,10 +200,9 @@ function OperationalApp() {
   const [resolvedAddress, setResolvedAddress] = useState("");
   const [locationError, setLocationError] = useState("");
   const [insurance, setInsurance] = useState("");
-  const [activeTab, setActiveTab] = useState(isHospitalPage ? "hospital" : "emt");
+  const [activeTab, setActiveTab] = useState(isHospitalPage ? "hospital" : isAdminMode ? "admin" : "emt");
   const [hospitalRequests, setHospitalRequests] = useState([]);
   const [sentRequests, setSentRequests] = useState({}); // { [hospitalId]: requestId }
-  const [selectedHospitalFilter, setSelectedHospitalFilter] = useState("");
   const [mapCenter, setMapCenter] = useState(centerGL);
   const [mapZoom, setMapZoom] = useState(defaultZoom);
   const [dispatch, setDispatch] = useState(null);
@@ -140,7 +224,7 @@ function OperationalApp() {
   }, [origin]);
 
   useEffect(() => {
-    fetch("/api/health")
+    apiFetch("/api/health")
       .then((response) => response.json())
       .then((data) => setVoiceEnabled(Boolean(data?.voice)))
       .catch(() => setVoiceEnabled(false));
@@ -159,8 +243,10 @@ function OperationalApp() {
 
   // Run once after Google Maps SDK is loaded: attempt GPS, fall back to IP
   // geolocation on failure (common on Mac when system permissions are denied).
+  // Hospital staff don't need the EMT map flow, so skip the auto-init for them.
   const didAutofillGpsRef = useRef(false);
   useEffect(() => {
+    if (user.role === "hospital") return;
     if (!isLoaded || didAutofillGpsRef.current) return;
     didAutofillGpsRef.current = true;
 
@@ -217,16 +303,17 @@ function OperationalApp() {
   // Poll hospital requests when on hospital page or tab
   useEffect(() => {
     if (!isHospitalPage && activeTab !== "hospital") return;
+    if (user.role !== "hospital" || !user.hospitalId) return;
     fetchHospitalRequests();
     const iv = setInterval(fetchHospitalRequests, 3500);
     return () => clearInterval(iv);
-  }, [activeTab, selectedHospitalFilter]);
+  }, [activeTab, user.hospitalId]);
 
   // Poll dispatch status while active
   useEffect(() => {
     if (!dispatch?.dispatchId || dispatch.status !== "active") return;
     const iv = setInterval(async () => {
-      const res = await fetch(`/api/dispatch/${dispatch.dispatchId}`);
+      const res = await apiFetch(`/api/dispatch/${dispatch.dispatchId}`);
       const data = await res.json();
       if (res.ok) setDispatch(data);
     }, 3000);
@@ -258,10 +345,10 @@ function OperationalApp() {
     }
   }, [dispatch]);
 
-  // Populate admin hospitals from nodes
+  // Populate admin hospitals from nodes (admin role only)
   useEffect(() => {
-    if (nodes.length === 0) return;
-    fetch("/api/admin/overrides")
+    if (user.role !== "admin" || nodes.length === 0) return;
+    apiFetch("/api/admin/overrides")
       .then((r) => r.json())
       .then((data) => {
         setAdminHospitals(
@@ -271,13 +358,12 @@ function OperationalApp() {
       .catch(() => {
         setAdminHospitals(nodes.map((n) => ({ hospitalId: n.id, hospitalName: n.name, override: null })));
       });
-  }, [nodes]);
+  }, [nodes, user.role]);
 
   async function fetchHospitalsByCoords(lat, lng) {
     try {
-      const res = await fetch("/api/hospitals-by-coords", {
+      const res = await apiFetch("/api/hospitals-by-coords", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ lat, lng }),
       });
       const data = await res.json();
@@ -297,22 +383,15 @@ function OperationalApp() {
   }
 
   async function fetchHospitalRequests() {
-    if (selectedHospitalFilter) {
-      const res = await fetch(`/api/hospitals/${selectedHospitalFilter}/incoming-patients`);
-      const data = await res.json();
-      setHospitalRequests((data.patients ?? []).map(patientToRequestCard));
-      return;
-    }
-
-    const res = await fetch("/api/requests");
+    if (user.role !== "hospital" || !user.hospitalId) return;
+    const res = await apiFetch(`/api/hospitals/${user.hospitalId}/incoming-patients`);
     const data = await res.json();
-    setHospitalRequests(data.requests ?? []);
+    setHospitalRequests((data.patients ?? []).map(patientToRequestCard));
   }
 
   async function handleRequest(candidate) {
-    const res = await fetch("/api/dispatch", {
+    const res = await apiFetch("/api/dispatch", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chain: [{
           hospitalId: candidate.id,
@@ -339,14 +418,13 @@ function OperationalApp() {
       availableBeds: c.availableBeds,
       waitMins: c.waitMins,
     }));
-    const res = await fetch("/api/dispatch", {
+    const res = await apiFetch("/api/dispatch", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chain, insurance: insurance || null }),
     });
     const data = await res.json();
     if (res.ok) {
-      const pollRes = await fetch(`/api/dispatch/${data.dispatchId}`);
+      const pollRes = await apiFetch(`/api/dispatch/${data.dispatchId}`);
       const pollData = await pollRes.json();
       if (pollRes.ok) setDispatch(pollData);
     }
@@ -354,9 +432,8 @@ function OperationalApp() {
 
   async function handlePatientHandoff() {
     if (dispatch?.activeRequest?.requestId) {
-      await fetch(`/api/requests/${dispatch.activeRequest.requestId}`, {
+      await apiFetch(`/api/requests/${dispatch.activeRequest.requestId}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status: "delivered" }),
       });
     }
@@ -373,9 +450,8 @@ function OperationalApp() {
   async function handleRequestAction(request, status) {
     if (request.source === "patient") {
       if (status === "accepted") {
-        await fetch(`/api/patients/${request.patientId}/accept`, {
+        await apiFetch(`/api/patients/${request.patientId}/accept`, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             hospitalId: request.hospitalId,
             hospitalName: request.hospitalName,
@@ -387,9 +463,8 @@ function OperationalApp() {
       return;
     }
 
-    await fetch(`/api/requests/${request.requestId}`, {
+    await apiFetch(`/api/requests/${request.requestId}`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
     });
     fetchHospitalRequests();
@@ -397,15 +472,14 @@ function OperationalApp() {
 
   async function handleAdminOverride(hospitalId, status) {
     if (!status) {
-      await fetch(`/api/admin/override/${hospitalId}`, { method: "DELETE" });
+      await apiFetch(`/api/admin/override/${hospitalId}`, { method: "DELETE" });
     } else {
-      await fetch("/api/admin/override", {
+      await apiFetch("/api/admin/override", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ hospitalId, status }),
       });
     }
-    const res = await fetch("/api/admin/overrides");
+    const res = await apiFetch("/api/admin/overrides");
     const data = await res.json();
     setAdminHospitals(
       nodes.map((n) => ({ hospitalId: n.id, hospitalName: n.name, override: data.overrides?.[n.id] ?? null }))
@@ -440,9 +514,8 @@ function OperationalApp() {
     const draft = locationDraft.trim();
     if (!draft) { setEditingLocation(false); return; }
     try {
-      const res = await fetch("/api/geocode", {
+      const res = await apiFetch("/api/geocode", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ address: draft }),
       });
       const data = await res.json();
@@ -469,9 +542,8 @@ function OperationalApp() {
 
       let summary;
       try {
-        const extractRes = await fetch("/api/extract-patient", {
+        const extractRes = await apiFetch("/api/extract-patient", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ transcript }),
         });
         summary = extractRes.ok ? await extractRes.json() : extractPatient(transcript);
@@ -545,9 +617,8 @@ function OperationalApp() {
 
   async function geocodeVoiceLocation(phrase) {
     try {
-      const res = await fetch("/api/geocode", {
+      const res = await apiFetch("/api/geocode", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ address: phrase }),
       });
       const data = await res.json();
@@ -566,9 +637,8 @@ function OperationalApp() {
     setSentRequests({});
     setDispatch(null);
     const effectiveInsurance = overrides.insurance ?? insurance;
-    const res = await fetch("/api/route", {
+    const res = await apiFetch("/api/route", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         origin: inputOrigin,
         insurance: effectiveInsurance || null,
@@ -598,9 +668,8 @@ function OperationalApp() {
       availableBeds: c.availableBeds,
       waitMins: c.waitMins,
     }));
-    const res = await fetch("/api/dispatch", {
+    const res = await apiFetch("/api/dispatch", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chain,
         insurance: effectiveInsurance || insurance || null,
@@ -610,7 +679,7 @@ function OperationalApp() {
     });
     if (!res.ok) return null;
     const dispatchMeta = await res.json();
-    const pollRes = await fetch(`/api/dispatch/${dispatchMeta.dispatchId}`);
+    const pollRes = await apiFetch(`/api/dispatch/${dispatchMeta.dispatchId}`);
     const dispatchData = await pollRes.json();
     if (pollRes.ok) setDispatch(dispatchData);
     return dispatchData;
@@ -638,21 +707,43 @@ function OperationalApp() {
     return <main className="screen bg-grid p-8 text-red-300">Failed to load Google Maps: {loadError.message}</main>;
   }
 
-  const tabs = isHospitalPage
+  // The role gate at the top of App() guarantees user.role === pageRole here.
+  const tabs = pageRole === "hospital"
     ? ["hospital"]
-    : ["emt", ...(isAdminMode ? ["admin"] : [])];
+    : pageRole === "admin"
+      ? ["admin"]
+      : ["emt"];
 
   return (
     <main className="screen bg-grid text-slate-100">
       <section className="mx-auto grid h-full w-full max-w-[1500px] grid-rows-[auto_auto_1fr] gap-4 p-4 lg:p-6">
         <header className="flex items-center gap-4 rounded-xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
-          <a href="/" className="flex items-center gap-4">
+          <a href="/" className="flex flex-1 items-center gap-4">
             <img src={logo} alt="Vital-Route logo" className="h-10 w-auto" />
             <div>
               <h1 className="text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
               <p className="mt-1 text-sm text-slate-300">optimize saving lives</p>
             </div>
           </a>
+          <div className="flex items-center gap-3 text-right">
+            <div className="hidden text-xs sm:block">
+              <p className="font-semibold text-slate-100">{user.displayName ?? user.username}</p>
+              <p className="text-[11px] uppercase tracking-wide text-slate-400">
+                {user.role === "hospital"
+                  ? user.hospitalName ?? "Hospital"
+                  : user.role === "admin"
+                    ? "Admin"
+                    : "EMT"}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={logout}
+              className="rounded-md border border-slate-600 bg-slate-900 px-3 py-1.5 text-xs font-semibold text-slate-200 transition hover:bg-slate-800"
+            >
+              Log out
+            </button>
+          </div>
         </header>
 
         {tabs.length > 1 && (
@@ -1013,16 +1104,14 @@ function OperationalApp() {
 
         {activeTab === "hospital" && (
           <HospitalView
-            nodes={nodes}
+            hospitalName={user.hospitalName}
             requests={hospitalRequests}
             onAccept={(request) => handleRequestAction(request, "accepted")}
             onDivert={(request) => handleRequestAction(request, "diverted")}
-            selectedHospitalFilter={selectedHospitalFilter}
-            onFilterChange={setSelectedHospitalFilter}
           />
         )}
 
-        {activeTab === "admin" && isAdminMode && (
+        {activeTab === "admin" && user.role === "admin" && (
           <AdminView hospitals={adminHospitals} onOverride={handleAdminOverride} />
         )}
       </section>
@@ -1060,9 +1149,8 @@ function buildVoiceReply(summary, resolvedOrigin, geocoded) {
 
 async function createPatientFromIntake(payload) {
   try {
-    const res = await fetch("/api/patients/intake", {
+    const res = await apiFetch("/api/patients/intake", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     const data = await res.json();
@@ -1074,9 +1162,8 @@ async function createPatientFromIntake(payload) {
 
 async function updatePatientFromVoice(patientId, payload) {
   try {
-    const res = await fetch(`/api/patients/${patientId}/voice-update`, {
+    const res = await apiFetch(`/api/patients/${patientId}/voice-update`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
     const data = await res.json();
@@ -1088,9 +1175,8 @@ async function updatePatientFromVoice(patientId, payload) {
 
 async function saveRouteRecommendation(patientId, recommended) {
   try {
-    await fetch(`/api/patients/${patientId}/route`, {
+    await apiFetch(`/api/patients/${patientId}/route`, {
       method: "PATCH",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         recommendedHospitalId: recommended.id,
         recommendedHospitalName: recommended.name,
@@ -1175,24 +1261,22 @@ function ElapsedTimer({ since }) {
   return <span className="font-mono text-sm font-semibold text-emerald-300">{mm}:{ss}</span>;
 }
 
-function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFilter, onFilterChange }) {
+function HospitalView({ hospitalName, requests, onAccept, onDivert }) {
   const [reportReq, setReportReq] = useState(null);
   return (
     <section className="grid min-h-0 grid-rows-[auto_1fr] gap-4">
       <div className="flex flex-col gap-3 rounded-xl border border-slate-700 bg-slate-950/70 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h2 className="text-lg font-semibold">Incoming Patient Requests</h2>
-          <p className="mt-1 text-sm text-slate-300">EMT notifications routed to this hospital. Auto-approved when capacity is healthy.</p>
+          <p className="mt-1 text-sm text-slate-300">
+            {hospitalName ? `${hospitalName} — ` : ""}EMT notifications routed to your hospital. Auto-approved when capacity is healthy.
+          </p>
         </div>
-        <select value={selectedHospitalFilter} onChange={(e) => onFilterChange(e.target.value)} className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-100">
-          <option value="">All hospitals</option>
-          {nodes.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}
-        </select>
       </div>
       <div className="min-h-0 overflow-auto">
         {requests.length === 0 ? (
           <div className="flex h-64 items-center justify-center rounded-xl border border-slate-700 bg-slate-950/70">
-            <p className="text-base text-slate-400">No incoming requests{selectedHospitalFilter ? " for this hospital" : ""}.</p>
+            <p className="text-base text-slate-400">No incoming requests for your hospital.</p>
           </div>
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">

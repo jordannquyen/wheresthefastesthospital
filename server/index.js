@@ -4,12 +4,25 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { randomUUID } from "node:crypto";
 import multer from "multer";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 import { Client } from "@googlemaps/google-maps-services-js";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import { MongoClient } from "mongodb";
 import Anthropic from "@anthropic-ai/sdk";
 
 dotenv.config();
+
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret) {
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("JWT_SECRET is required in production");
+  }
+  console.warn("⚠️  JWT_SECRET is not set — auth endpoints will reject all requests. Set JWT_SECRET in .env.");
+}
+const signupAdminToken = process.env.SIGNUP_ADMIN_TOKEN || null;
+const JWT_EXPIRES_IN = "12h";
+const VALID_ROLES = new Set(["emt", "hospital", "admin"]);
 
 const requests = {};
 const dispatches = {};
@@ -38,6 +51,7 @@ const mongoDbName = process.env.MONGODB_DB_NAME;
 
 let mongoClient = null;
 let patientsCollection = null;
+let usersCollection = null;
 
 app.use(cors());
 app.use(express.json());
@@ -52,6 +66,10 @@ function getPatientsCollectionOrNull() {
   return patientsCollection;
 }
 
+function getUsersCollectionOrNull() {
+  return usersCollection;
+}
+
 async function initializeMongo() {
   if (!mongoUri || !mongoDbName) {
     console.warn("MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME to enable patient persistence.");
@@ -62,6 +80,7 @@ async function initializeMongo() {
   await mongoClient.connect();
   const db = mongoClient.db(mongoDbName);
   patientsCollection = db.collection("patients");
+  usersCollection = db.collection("users");
 
   await patientsCollection.createIndexes([
     { key: { patientId: 1 }, unique: true },
@@ -71,6 +90,11 @@ async function initializeMongo() {
     { key: { recommendedHospitalId: 1, status: 1 } },
     { key: { createdAt: -1 } },
     { key: { updatedAt: -1 } },
+  ]);
+
+  await usersCollection.createIndexes([
+    { key: { username: 1 }, unique: true },
+    { key: { hospitalId: 1 } },
   ]);
 
   console.log(`Connected to MongoDB Atlas database: ${mongoDbName}`);
@@ -395,6 +419,167 @@ async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit 
   }
 }
 
+// --- Auth middleware ---
+
+function authRequired(req, res, next) {
+  if (!jwtSecret) return res.status(500).json({ error: "auth not configured" });
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "auth required" });
+  try {
+    req.user = jwt.verify(token, jwtSecret);
+    next();
+  } catch {
+    return res.status(401).json({ error: "invalid token" });
+  }
+}
+
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    next();
+  };
+}
+
+function requireHospitalScope(req, res, next) {
+  const claimedId = req.user?.hospitalId;
+  const requestedId = req.params.hospitalId || req.query.hospitalId;
+  if (!claimedId) return res.status(403).json({ error: "no hospital binding" });
+  if (requestedId && String(requestedId) !== String(claimedId)) {
+    return res.status(403).json({ error: "cannot access another hospital's data" });
+  }
+  next();
+}
+
+function userToPublic(user) {
+  if (!user) return null;
+  return {
+    userId: user.userId,
+    username: user.username,
+    role: user.role,
+    hospitalId: user.hospitalId ?? null,
+    hospitalName: user.hospitalName ?? null,
+    displayName: user.displayName ?? null,
+  };
+}
+
+function signTokenForUser(user) {
+  return jwt.sign(
+    {
+      sub: user.userId,
+      username: user.username,
+      role: user.role,
+      hospitalId: user.hospitalId ?? null,
+      hospitalName: user.hospitalName ?? null,
+    },
+    jwtSecret,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
+}
+
+// --- Auth endpoints ---
+
+app.post("/api/auth/signup", ah(async (req, res) => {
+  const collection = getUsersCollectionOrNull();
+  if (!collection) return res.status(503).json({ error: "MongoDB is not configured" });
+  if (!jwtSecret) return res.status(500).json({ error: "auth not configured" });
+
+  const { username, password, role, hospitalId, displayName, adminToken } = req.body ?? {};
+
+  if (typeof username !== "string" || username.trim().length < 3) {
+    return res.status(400).json({ error: "username must be at least 3 characters" });
+  }
+  if (typeof password !== "string" || password.length < 6) {
+    return res.status(400).json({ error: "password must be at least 6 characters" });
+  }
+  if (!VALID_ROLES.has(role)) {
+    return res.status(400).json({ error: "role must be emt, hospital, or admin" });
+  }
+
+  const normalizedUsername = username.trim().toLowerCase();
+
+  let resolvedHospitalId = null;
+  let resolvedHospitalName = null;
+  if (role === "hospital") {
+    if (!hasValue(hospitalId)) {
+      return res.status(400).json({ error: "hospitalId is required for hospital role" });
+    }
+    const hospitals = await fetchAndCacheHospitals("LOS ANGELES", "CA");
+    const match = hospitals.find((h) => String(h.id) === String(hospitalId));
+    if (!match) {
+      return res.status(400).json({ error: "hospitalId does not match any known hospital" });
+    }
+    resolvedHospitalId = String(match.id);
+    resolvedHospitalName = match.name;
+  }
+
+  if (role === "admin" && signupAdminToken) {
+    if (adminToken !== signupAdminToken) {
+      return res.status(403).json({ error: "invalid admin signup token" });
+    }
+  }
+
+  const existing = await collection.findOne({ username: normalizedUsername });
+  if (existing) return res.status(409).json({ error: "username already taken" });
+
+  const passwordHash = await bcrypt.hash(password, 10);
+  const now = new Date();
+  const userDoc = {
+    userId: randomUUID(),
+    username: normalizedUsername,
+    passwordHash,
+    role,
+    hospitalId: resolvedHospitalId,
+    hospitalName: resolvedHospitalName,
+    displayName: hasValue(displayName) ? String(displayName).trim() : null,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await collection.insertOne(userDoc);
+  const token = signTokenForUser(userDoc);
+  return res.status(201).json({ token, user: userToPublic(userDoc) });
+}));
+
+app.post("/api/auth/login", ah(async (req, res) => {
+  const collection = getUsersCollectionOrNull();
+  if (!collection) return res.status(503).json({ error: "MongoDB is not configured" });
+  if (!jwtSecret) return res.status(500).json({ error: "auth not configured" });
+
+  const { username, password } = req.body ?? {};
+  if (typeof username !== "string" || typeof password !== "string") {
+    return res.status(400).json({ error: "username and password are required" });
+  }
+
+  const user = await collection.findOne({ username: username.trim().toLowerCase() });
+  if (!user) return res.status(401).json({ error: "invalid credentials" });
+  const ok = await bcrypt.compare(password, user.passwordHash);
+  if (!ok) return res.status(401).json({ error: "invalid credentials" });
+
+  const token = signTokenForUser(user);
+  return res.json({ token, user: userToPublic(user) });
+}));
+
+app.post("/api/auth/logout", authRequired, (_req, res) => {
+  return res.json({ ok: true });
+});
+
+app.get("/api/auth/me", authRequired, ah(async (req, res) => {
+  const collection = getUsersCollectionOrNull();
+  if (!collection) return res.status(503).json({ error: "MongoDB is not configured" });
+  const user = await collection.findOne({ userId: req.user.sub }, { projection: { passwordHash: 0, _id: 0 } });
+  if (!user) return res.status(401).json({ error: "user no longer exists" });
+  return res.json({ user: userToPublic(user) });
+}));
+
+// Public list of hospitals for signup UI — only id + name, no PHI.
+app.get("/api/auth/hospitals-list", ah(async (_req, res) => {
+  const hospitals = await fetchAndCacheHospitals("LOS ANGELES", "CA");
+  return res.json({ hospitals: hospitals.map((h) => ({ id: h.id, name: h.name })) });
+}));
+
 // --- Core endpoints ---
 
 app.get("/api/health", (_req, res) => {
@@ -407,7 +592,7 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-app.post("/api/extract-patient", async (req, res) => {
+app.post("/api/extract-patient", authRequired, async (req, res) => {
   if (!anthropic) {
     return res.status(503).json({ error: "ANTHROPIC_API_KEY not configured" });
   }
@@ -471,7 +656,7 @@ Transcript: ${JSON.stringify(transcript)}`;
 
 // --- Patient endpoints ---
 
-app.post("/api/patients/intake", ah(async (req, res) => {
+app.post("/api/patients/intake", authRequired, ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -496,7 +681,7 @@ app.post("/api/patients/intake", ah(async (req, res) => {
   return res.status(201).json({ patient: serializePatient(patient) });
 }));
 
-app.get("/api/patients", ah(async (req, res) => {
+app.get("/api/patients", authRequired, ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -516,7 +701,7 @@ app.get("/api/patients", ah(async (req, res) => {
   return res.json({ patients, count: patients.length });
 }));
 
-app.get("/api/patients/:patientId", ah(async (req, res) => {
+app.get("/api/patients/:patientId", authRequired, ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -530,7 +715,7 @@ app.get("/api/patients/:patientId", ah(async (req, res) => {
   return res.json({ patient });
 }));
 
-app.patch("/api/patients/:patientId/voice-update", ah(async (req, res) => {
+app.patch("/api/patients/:patientId/voice-update", authRequired, ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -553,7 +738,7 @@ app.patch("/api/patients/:patientId/voice-update", ah(async (req, res) => {
   return res.json({ patient: serializePatient(result) });
 }));
 
-app.patch("/api/patients/:patientId/route", ah(async (req, res) => {
+app.patch("/api/patients/:patientId/route", authRequired, ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -584,7 +769,7 @@ app.patch("/api/patients/:patientId/route", ah(async (req, res) => {
   return res.json({ patient: serializePatient(result) });
 }));
 
-app.patch("/api/patients/:patientId/accept", ah(async (req, res) => {
+app.patch("/api/patients/:patientId/accept", authRequired, requireRole("hospital"), ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -593,6 +778,19 @@ app.patch("/api/patients/:patientId/accept", ah(async (req, res) => {
   const { hospitalId, hospitalName, etaMinutes } = req.body ?? {};
   if (!hasValue(hospitalId) || !hasValue(hospitalName)) {
     return res.status(400).json({ error: "hospitalId and hospitalName are required" });
+  }
+
+  if (String(hospitalId) !== String(req.user.hospitalId)) {
+    return res.status(403).json({ error: "cannot accept on behalf of another hospital" });
+  }
+
+  const existing = await collection.findOne({ patientId: req.params.patientId }, { projection: { _id: 0 } });
+  if (!existing) return res.status(404).json({ error: "patient not found" });
+  const isRoutedHere =
+    String(existing.recommendedHospitalId ?? "") === String(req.user.hospitalId) ||
+    String(existing.assignedHospitalId ?? "") === String(req.user.hospitalId);
+  if (!isRoutedHere) {
+    return res.status(403).json({ error: "patient is not routed to your hospital" });
   }
 
   const updates = {
@@ -618,7 +816,7 @@ app.patch("/api/patients/:patientId/accept", ah(async (req, res) => {
   return res.json({ patient: serializePatient(result) });
 }));
 
-app.patch("/api/patients/:patientId", ah(async (req, res) => {
+app.patch("/api/patients/:patientId", authRequired, ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
@@ -640,13 +838,14 @@ app.patch("/api/patients/:patientId", ah(async (req, res) => {
   return res.json({ patient: serializePatient(result) });
 }));
 
-app.get("/api/hospitals/:hospitalId/incoming-patients", ah(async (req, res) => {
+app.get("/api/hospitals/:hospitalId/incoming-patients", authRequired, requireRole("hospital"), requireHospitalScope, ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
   }
 
-  const hospitalId = req.params.hospitalId;
+  // Use the claim, not the URL param — defense in depth.
+  const hospitalId = String(req.user.hospitalId);
   const severityOrder = { critical: 0, high: 1, moderate: 2, low: 3 };
   const patients = await collection
     .find({
@@ -667,14 +866,14 @@ app.get("/api/hospitals/:hospitalId/incoming-patients", ah(async (req, res) => {
   return res.json({ patients, count: patients.length });
 }));
 
-app.get("/api/nodes", ah(async (req, res) => {
+app.get("/api/nodes", authRequired, ah(async (req, res) => {
   const { city, state = "CA" } = req.query;
   if (!city) return res.json({ nodes: [] });
   const hospitals = await fetchAndCacheHospitals(city.toUpperCase(), state);
   res.json({ nodes: hospitals });
 }));
 
-app.post("/api/hospitals-by-coords", async (req, res) => {
+app.post("/api/hospitals-by-coords", authRequired, async (req, res) => {
   const { lat, lng } = req.body ?? {};
   if (typeof lat !== "number" || typeof lng !== "number") {
     return res.status(400).json({ error: "lat and lng are required numbers" });
@@ -688,7 +887,7 @@ app.post("/api/hospitals-by-coords", async (req, res) => {
   }
 });
 
-app.get("/api/telemetry", ah(async (req, res) => {
+app.get("/api/telemetry", authRequired, ah(async (req, res) => {
   const { city, state = "CA" } = req.query;
   if (!city) return res.json({ updatedAt: new Date().toISOString(), nodes: {} });
 
@@ -707,7 +906,7 @@ app.get("/api/telemetry", ah(async (req, res) => {
   res.json({ updatedAt: new Date().toISOString(), nodes: telemetryNodes });
 }));
 
-app.get("/api/hospitals", async (req, res) => {
+app.get("/api/hospitals", authRequired, async (req, res) => {
   const { city, state = "CA", limit = 100 } = req.query;
   try {
     const socrataUrl = new URL("https://healthdata.gov/resource/anag-cw7u.json");
@@ -743,7 +942,7 @@ app.get("/api/hospitals", async (req, res) => {
   }
 });
 
-app.post("/api/geocode", async (req, res) => {
+app.post("/api/geocode", authRequired, async (req, res) => {
   const { address } = req.body ?? {};
   if (!address || typeof address !== "string") {
     return res.status(400).json({ error: "address is required" });
@@ -768,7 +967,7 @@ app.post("/api/geocode", async (req, res) => {
   }
 });
 
-app.post("/api/route", async (req, res) => {
+app.post("/api/route", authRequired, async (req, res) => {
   const { origin, insurance } = req.body ?? {};
   if (!origin || typeof origin.lat !== "number" || typeof origin.lng !== "number") {
     return res.status(400).json({ error: "origin.lat and origin.lng are required numeric fields" });
@@ -782,7 +981,7 @@ app.post("/api/route", async (req, res) => {
   }
 });
 
-app.post("/api/stt", uploadAudio.single("audio"), async (req, res) => {
+app.post("/api/stt", authRequired, uploadAudio.single("audio"), async (req, res) => {
   if (!elevenlabs) {
     return res.status(503).json({ error: "ELEVENLABS_API_KEY not configured" });
   }
@@ -807,7 +1006,7 @@ app.post("/api/stt", uploadAudio.single("audio"), async (req, res) => {
   }
 });
 
-app.post("/api/tts", async (req, res) => {
+app.post("/api/tts", authRequired, async (req, res) => {
   if (!elevenlabs) {
     return res.status(503).json({ error: "ELEVENLABS_API_KEY not configured" });
   }
@@ -839,7 +1038,7 @@ app.post("/api/tts", async (req, res) => {
 
 // --- Dispatch endpoints ---
 
-app.post("/api/dispatch", ah(async (req, res) => {
+app.post("/api/dispatch", authRequired, ah(async (req, res) => {
   const { chain, insurance, patientId, patientSummary } = req.body ?? {};
   if (!Array.isArray(chain) || chain.length === 0) {
     return res.status(400).json({ error: "chain must be a non-empty array" });
@@ -883,7 +1082,7 @@ app.post("/api/dispatch", ah(async (req, res) => {
   return res.json({ dispatchId, requestId, status: requests[requestId].status, autoApproved: requests[requestId].autoApproved });
 }));
 
-app.get("/api/dispatch/:dispatchId", (req, res) => {
+app.get("/api/dispatch/:dispatchId", authRequired, (req, res) => {
   const dispatch = dispatches[req.params.dispatchId];
   if (!dispatch) return res.status(404).json({ error: "dispatch not found" });
 
@@ -910,23 +1109,32 @@ app.get("/api/dispatch/:dispatchId", (req, res) => {
 
 // --- Request endpoints ---
 
-app.get("/api/requests", (req, res) => {
-  const { hospitalId } = req.query;
+app.get("/api/requests", authRequired, (req, res) => {
+  let { hospitalId } = req.query;
+  // Hospital users may only see their own hospital's requests, regardless of query.
+  if (req.user.role === "hospital") hospitalId = req.user.hospitalId;
   let result = Object.values(requests);
-  if (hospitalId) result = result.filter((r) => r.hospitalId === hospitalId);
+  if (hospitalId) result = result.filter((r) => String(r.hospitalId) === String(hospitalId));
   result.sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
   res.json({ requests: result });
 });
 
-app.patch("/api/requests/:requestId", ah(async (req, res) => {
+app.patch("/api/requests/:requestId", authRequired, ah(async (req, res) => {
   const { requestId } = req.params;
   const { status } = req.body ?? {};
   const record = requests[requestId];
 
   if (!record) return res.status(404).json({ error: "request not found" });
 
-  // Allow delivered transition from accepted; block everything else on resolved requests
+  // EMTs may mark a request as delivered (handoff at the hospital).
+  // Only the receiving hospital may accept or divert.
   if (status === "delivered") {
+    if (req.user.role !== "emt" && req.user.role !== "hospital") {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    if (req.user.role === "hospital" && String(record.hospitalId) !== String(req.user.hospitalId)) {
+      return res.status(403).json({ error: "cannot modify another hospital's request" });
+    }
     if (record.status !== "accepted") return res.status(409).json({ error: "can only deliver an accepted request" });
     record.status = "delivered";
     record.deliveredAt = new Date().toISOString();
@@ -935,6 +1143,10 @@ app.patch("/api/requests/:requestId", ah(async (req, res) => {
     return res.json({ ok: true, requestId, status: "delivered" });
   }
 
+  if (req.user.role !== "hospital") return res.status(403).json({ error: "forbidden" });
+  if (String(record.hospitalId) !== String(req.user.hospitalId)) {
+    return res.status(403).json({ error: "cannot modify another hospital's request" });
+  }
   if (record.status !== "pending") return res.status(409).json({ error: "request already resolved" });
   if (status !== "accepted" && status !== "diverted") {
     return res.status(400).json({ error: "status must be accepted or diverted" });
@@ -985,7 +1197,7 @@ app.patch("/api/requests/:requestId", ah(async (req, res) => {
 
 // --- Admin override endpoints ---
 
-app.post("/api/admin/override", (req, res) => {
+app.post("/api/admin/override", authRequired, requireRole("admin"), (req, res) => {
   const { hospitalId, status } = req.body ?? {};
   if (!["Open", "Saturation", "Diversion"].includes(status)) {
     return res.status(400).json({ error: "status must be Open, Saturation, or Diversion" });
@@ -994,12 +1206,12 @@ app.post("/api/admin/override", (req, res) => {
   return res.json({ ok: true, hospitalId, status });
 });
 
-app.delete("/api/admin/override/:hospitalId", (req, res) => {
+app.delete("/api/admin/override/:hospitalId", authRequired, requireRole("admin"), (req, res) => {
   delete hospitalOverrides[req.params.hospitalId];
   return res.json({ ok: true, hospitalId: req.params.hospitalId });
 });
 
-app.get("/api/admin/overrides", (_req, res) => {
+app.get("/api/admin/overrides", authRequired, requireRole("admin"), (_req, res) => {
   return res.json({ overrides: hospitalOverrides });
 });
 

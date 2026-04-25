@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { apiFetch } from "../lib/api.js";
 
 function pickMimeType() {
   const candidates = [
@@ -95,7 +96,7 @@ export function useVoice() {
           const ext = (recorder.mimeType || "audio/webm").includes("mp4") ? "mp4" : "webm";
           formData.append("audio", blob, `intake.${ext}`);
 
-          const response = await fetch("/api/stt", {
+          const response = await apiFetch("/api/stt", {
             method: "POST",
             body: formData,
           });
@@ -132,9 +133,8 @@ export function useVoice() {
 
     try {
       setIsSpeaking(true);
-      const response = await fetch("/api/tts", {
+      const response = await apiFetch("/api/tts", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),
       });
 
