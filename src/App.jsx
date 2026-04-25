@@ -44,6 +44,7 @@ function App() {
   const addressInputRef = useRef(null);
   const mapRef = useRef(null);
   const originRef = useRef(origin);
+  const prevDispatchRef = useRef(null);
   const voice = useVoice();
 
   useEffect(() => {
@@ -138,6 +139,31 @@ function App() {
     }, 3000);
     return () => clearInterval(iv);
   }, [dispatch?.dispatchId, dispatch?.status]);
+
+  // Announce dispatch status changes via TTS
+  useEffect(() => {
+    if (!dispatch || !voiceEnabled) { prevDispatchRef.current = dispatch; return; }
+    const prev = prevDispatchRef.current;
+    prevDispatchRef.current = dispatch;
+    if (!prev) return; // initial set — already announced at dispatch time
+
+    const hospital = dispatch.currentHospital;
+    const prevHospital = prev.currentHospital;
+
+    if (dispatch.status === "accepted" && prev.status !== "accepted") {
+      voice.speak(`Confirmed. ${hospital?.hospitalName} is ready. En route.`);
+    } else if (dispatch.status === "exhausted" && prev.status !== "exhausted") {
+      voice.speak("All hospitals have diverted. Please contact dispatch for further instructions.");
+    } else if (dispatch.currentIndex > (prev.currentIndex ?? 0)) {
+      const eta = hospital?.etaMins ?? "unknown";
+      const autoApproved = dispatch.activeRequest?.autoApproved;
+      if (autoApproved) {
+        voice.speak(`${prevHospital?.hospitalName} diverted. Auto-approved at ${hospital?.hospitalName}, ${eta} minutes away. En route.`);
+      } else {
+        voice.speak(`${prevHospital?.hospitalName} diverted. Escalating to ${hospital?.hospitalName}, ${eta} minutes away. Awaiting confirmation.`);
+      }
+    }
+  }, [dispatch]);
 
   // Populate admin hospitals from nodes
   useEffect(() => {
@@ -292,13 +318,20 @@ function App() {
         }
       }
 
-      const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
-      voice.speak(reply);
-
       if (resolvedOrigin && geocoded) {
-        await requestRecommendations(resolvedOrigin, {
-          insurance: summary.insurance,
-        });
+        const routeData = await requestRecommendations(resolvedOrigin, { insurance: summary.insurance });
+        const dispatchData = await autoDispatch(routeData);
+        const hospital = dispatchData?.currentHospital;
+        const req = dispatchData?.activeRequest;
+        const eta = hospital?.etaMins ?? "unknown";
+        const statusPhrase = req?.autoApproved
+          ? "Auto-approved. En route."
+          : "Awaiting hospital confirmation.";
+        const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
+        voice.speak(`${reply} Dispatching to ${hospital?.hospitalName ?? "top hospital"}, ${eta} minutes away. ${statusPhrase}`);
+      } else {
+        const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
+        voice.speak(reply);
       }
     } else {
       setPatientSummary(null);
@@ -345,6 +378,30 @@ function App() {
         `No hospitals accepting ${data.insurance} found nearby, showing best available options.`,
       );
     }
+    return data;
+  }
+
+  async function autoDispatch(routeData) {
+    if (!routeData?.top3?.length) return null;
+    const chain = routeData.top3.map((c) => ({
+      hospitalId: c.id,
+      hospitalName: c.name,
+      etaMins: c.durationMins,
+      utilization: c.utilization,
+      availableBeds: c.availableBeds,
+      waitMins: c.waitMins,
+    }));
+    const res = await fetch("/api/dispatch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chain, insurance: insurance || null }),
+    });
+    if (!res.ok) return null;
+    const dispatchMeta = await res.json();
+    const pollRes = await fetch(`/api/dispatch/${dispatchMeta.dispatchId}`);
+    const dispatchData = await pollRes.json();
+    if (pollRes.ok) setDispatch(dispatchData);
+    return dispatchData;
   }
 
   const selectedHospital =
