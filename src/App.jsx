@@ -535,6 +535,9 @@ function App() {
                           <p className="flex items-center gap-2 font-medium text-slate-100">
                             <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 text-sm font-bold text-cyan-300">{rankLabels[index]}</span>
                             {candidate.name}
+                            {index === 0 && dispatch?.activeRequest?.autoApproved && (
+                              <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">Auto-Accepted</span>
+                            )}
                           </p>
                           <p className="mt-1 text-xs text-slate-300">
                             {candidate.distanceMiles} mi | {candidate.availableBeds} beds avail | {Math.round(candidate.utilization * 100)}% util | {candidate.waitMins} min wait
