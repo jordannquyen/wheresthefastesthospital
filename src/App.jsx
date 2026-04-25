@@ -542,27 +542,6 @@ function App() {
                   onLoad={(map) => { mapRef.current = map; }}
                   onClick={handleMapClick}
                 >
-                  {nodes.map((node) => {
-                    const util = nodeUtilization(node);
-                    const color = getNodeColor(util);
-                    const congested = util >= 0.97;
-                    return (
-                      <Circle
-                        key={`circle-${node.id}`}
-                        center={{ lat: node.lat, lng: node.lng }}
-                        radius={congested ? 1350 : 960}
-                        options={{
-                          fillColor: color,
-                          fillOpacity: congested ? 0.46 : 0.26,
-                          strokeColor: color,
-                          strokeOpacity: 0.85,
-                          strokeWeight: congested ? 2.5 : 1.4,
-                          clickable: true,
-                        }}
-                        onClick={() => setSelectedHospitalId(node.id)}
-                      />
-                    );
-                  })}
 
                   {nodes.map((node) => {
                     const util = nodeUtilization(node);
@@ -574,7 +553,7 @@ function App() {
                         onClick={() => setSelectedHospitalId(node.id)}
                         icon={{
                           path: window.google.maps.SymbolPath.CIRCLE,
-                          scale: util >= 0.97 && pulseTick ? 10 : 8,
+                          scale: 8,
                           fillColor: getNodeColor(util),
                           fillOpacity: 1,
                           strokeColor: "#e2e8f0",
@@ -671,8 +650,8 @@ function App() {
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-200">Legend</p>
                 <ul className="mt-2 space-y-1.5 text-xs text-slate-300">
                   <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" />Green: &lt;70% util</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 70-96% util</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500" />Red pulse: 97%+ util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 70–96% util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500" />Red: 97%+ util</li>
                   <li><span className="mr-2 inline-block h-[2px] w-6 bg-sky-400 align-middle" />Top recommendation</li>
                   <li><span className="mr-2 inline-block h-[2px] w-6 border-b border-dashed border-slate-400 align-middle" />Closest baseline</li>
                 </ul>
