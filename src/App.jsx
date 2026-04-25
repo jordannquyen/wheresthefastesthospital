@@ -64,6 +64,17 @@ function App() {
     libraries: mapsLibraries,
   });
 
+  // The autocomplete input is uncontrolled (so Google Places can write
+  // selected suggestions into it without React clobbering them on the next
+  // render). Mirror locationAddress onto the DOM ref so programmatic updates
+  // — voice geocode, GPS reverse-geocode — still appear in the field.
+  useEffect(() => {
+    if (!addressInputRef.current) return;
+    if (addressInputRef.current.value !== locationAddress) {
+      addressInputRef.current.value = locationAddress ?? "";
+    }
+  }, [locationAddress, isLoaded]);
+
   useEffect(() => {
     const pulseInterval = setInterval(() => setPulseTick((c) => !c), 900);
     return () => clearInterval(pulseInterval);
@@ -640,7 +651,6 @@ function App() {
                       <input
                         ref={addressInputRef}
                         type="text"
-                        value={locationAddress}
                         onChange={(e) => setLocationAddress(e.target.value)}
                         className="w-full rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
                         placeholder="Start typing an address"
