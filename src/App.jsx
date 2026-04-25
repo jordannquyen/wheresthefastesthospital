@@ -226,12 +226,33 @@ function App() {
     event.preventDefault();
     const addressValue = addressInputRef.current?.value?.trim() || locationAddress.trim();
     if (!addressValue) { setLocationError("Enter an address to continue."); return; }
+
+    // Use Places Autocomplete geometry if available — avoids backend geocoder
+    if (addressAutocomplete) {
+      const place = addressAutocomplete.getPlace?.();
+      if (place?.geometry) {
+        const loc = place.geometry.location;
+        const selectedOrigin = {
+          lat: Number(loc.lat().toFixed(6)),
+          lng: Number(loc.lng().toFixed(6)),
+        };
+        const displayAddress = place.formatted_address || place.name || addressValue;
+        setLocationAddress(displayAddress);
+        setResolvedAddress(displayAddress);
+        setLocationError("");
+        await fetchHospitalsByCoords(selectedOrigin.lat, selectedOrigin.lng);
+        await requestRecommendations(selectedOrigin);
+        return;
+      }
+    }
+
+    // Fallback: backend geocoder
     try {
       setLocationError("");
       const geoRes = await fetch("/api/geocode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: locationAddress.trim() }),
+        body: JSON.stringify({ address: addressValue }),
       });
       const geoData = await geoRes.json();
       if (!geoRes.ok) { setLocationError(geoData.error ?? "Unable to resolve address."); return; }
@@ -507,7 +528,7 @@ function App() {
                         Spec: <span className="font-mono text-cyan-300">{route.specification.toUpperCase()}</span>
                       </p>
                     )}
-                    <p>Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)</p>
+                    {route.closest && <p>Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)</p>}
                     <div className="space-y-2 pt-1">
                       {(route.top3 || []).map((candidate, index) => (
                         <div key={candidate.id} className="rounded-lg border border-slate-700 bg-slate-900/60 p-2">
@@ -518,14 +539,6 @@ function App() {
                           <p className="mt-1 text-xs text-slate-300">
                             {candidate.distanceMiles} mi | {candidate.availableBeds} beds avail | {Math.round(candidate.utilization * 100)}% util | {candidate.waitMins} min wait
                           </p>
-                          <button
-                            type="button"
-                            onClick={() => handleRequest(candidate)}
-                            disabled={!!sentRequests[candidate.id]}
-                            className={`mt-2 w-full rounded-lg px-3 py-1.5 text-xs font-semibold transition ${sentRequests[candidate.id] ? "cursor-not-allowed bg-slate-700 text-slate-400" : "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30"}`}
-                          >
-                            {sentRequests[candidate.id] ? "Notified ✓" : "Notify Hospital"}
-                          </button>
                         </div>
                       ))}
                     </div>

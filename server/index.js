@@ -29,6 +29,10 @@ function deduplicateByLatestWeek(rawRecords) {
 }
 
 async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
+  const key = `${lat.toFixed(2)},${lng.toFixed(2)}`;
+  if (distanceCache.key === key && Date.now() - distanceCache.ts < DISTANCE_CACHE_TTL) {
+    return distanceCache.result;
+  }
   try {
     const socrataUrl = new URL("https://healthdata.gov/resource/anag-cw7u.json");
     socrataUrl.searchParams.set("$limit", 1000);
@@ -73,12 +77,17 @@ async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
       };
     });
 
-    return mapped.filter((h) => h.distance <= radiusMiles).sort((a, b) => a.distance - b.distance);
+    const result = mapped.filter((h) => h.distance <= radiusMiles).sort((a, b) => a.distance - b.distance);
+    distanceCache = { key, result, ts: Date.now() };
+    return result;
   } catch (error) {
     console.error("Failed to fetch hospitals by distance:", error);
-    return [];
+    return distanceCache.result;
   }
 }
+
+let distanceCache = { key: null, result: [], ts: 0 };
+const DISTANCE_CACHE_TTL = 60000;
 
 let cachedHospitals = [];
 let cacheTimestamp = 0;
@@ -521,6 +530,7 @@ function normalizeInsurance(input) {
 }
 
 async function getTravelMetrics(origin, nodes) {
+  if (nodes.length === 0) return [];
   if (!googleMapsApiKey) {
     return nodes.map((node) => {
       const distanceMiles = haversineMiles(origin.lat, origin.lng, node.lat, node.lng);
