@@ -9,6 +9,7 @@ import {
   useJsApiLoader,
 } from "@react-google-maps/api";
 
+const isAdminMode = new URLSearchParams(window.location.search).has("admin");
 const centerGL = { lat: 20, lng: 0 };
 const defaultZoom = 2;
 const mapContainerStyle = { width: "100%", height: "100%" };
@@ -31,10 +32,11 @@ function App() {
   const [addressAutocomplete, setAddressAutocomplete] = useState(null);
   const [activeTab, setActiveTab] = useState("emt");
   const [hospitalRequests, setHospitalRequests] = useState([]);
-  const [sentRequests, setSentRequests] = useState({});
   const [selectedHospitalFilter, setSelectedHospitalFilter] = useState("");
   const [mapCenter, setMapCenter] = useState(centerGL);
   const [mapZoom, setMapZoom] = useState(defaultZoom);
+  const [dispatch, setDispatch] = useState(null);
+  const [adminHospitals, setAdminHospitals] = useState([]);
 
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
@@ -84,13 +86,7 @@ function App() {
     const res = await fetch("/api/requests", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        hospitalId: candidate.id,
-        hospitalName: candidate.name,
-        patientSpec: specification || null,
-        insurance: insurance || null,
-        etaMins: candidate.durationMins,
-      }),
+      body: JSON.stringify({ chain, patientSpec: specification || null, insurance: insurance || null }),
     });
     const data = await res.json();
     if (res.ok) setSentRequests((prev) => ({ ...prev, [candidate.id]: data.requestId }));
@@ -146,8 +142,6 @@ function App() {
     null;
   const selectedStats = getHospitalStats(selectedHospital);
 
-  const [addressInputRef, setAddressInputRef] = useState(null);
-
   async function handleLocationSubmit(event) {
     event.preventDefault();
     const addressValue = addressInputRef?.value?.trim() || locationAddress.trim();
@@ -157,7 +151,7 @@ function App() {
       const geoRes = await fetch("/api/geocode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: addressValue }),
+        body: JSON.stringify({ address: locationAddress.trim() }),
       });
       const geoData = await geoRes.json();
       if (!geoRes.ok) { setLocationError(geoData.error ?? "Unable to resolve address."); return; }
@@ -453,6 +447,37 @@ function App() {
                         </div>
                       ))}
                     </div>
+
+                    {!dispatch ? (
+                      <button
+                        type="button"
+                        onClick={handleDispatch}
+                        className="mt-2 w-full rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
+                      >
+                        Dispatch Patient to #1 Recommended
+                      </button>
+                    ) : (
+                      <div className={`mt-2 rounded-lg border p-3 text-sm ${dispatchPanelClass(dispatch.status)}`}>
+                        {dispatch.status === "active" && (
+                          <>
+                            <p className="font-semibold">Dispatched → {dispatch.currentHospital?.hospitalName}</p>
+                            <p className="mt-1 text-xs opacity-80">
+                              {dispatch.activeRequest?.autoApproved
+                                ? "Auto-approved — en route"
+                                : dispatch.activeRequest?.status === "pending"
+                                ? "Awaiting hospital confirmation..."
+                                : dispatch.activeRequest?.status}
+                            </p>
+                          </>
+                        )}
+                        {dispatch.status === "accepted" && (
+                          <p className="font-semibold">Confirmed — heading to {dispatch.currentHospital?.hospitalName}</p>
+                        )}
+                        {dispatch.status === "exhausted" && (
+                          <p className="font-semibold">All hospitals diverted — contact dispatch</p>
+                        )}
+                      </div>
+                    )}
                   </div>
                 )}
               </section>
@@ -472,6 +497,51 @@ function App() {
         )}
       </section>
     </main>
+  );
+}
+
+function AdminView({ hospitals, onOverride }) {
+  const statusOptions = ["Open", "Saturation", "Diversion"];
+  return (
+    <section className="min-h-0 overflow-auto">
+      <div className="mb-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 p-4">
+        <p className="text-sm font-semibold text-amber-200">Demo Admin — Hospital Status Overrides</p>
+        <p className="mt-1 text-xs text-amber-300/70">Force hospital status to test the diversion chain. Overrides block auto-approve so requests come in as pending.</p>
+      </div>
+      {hospitals.length === 0 && (
+        <p className="text-sm text-slate-400">Search for a location on the EMT tab first to load hospitals.</p>
+      )}
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {hospitals.map((h) => (
+          <div key={h.hospitalId} className="rounded-[28px] border border-slate-700 bg-slate-900/60 p-4">
+            <p className="font-semibold text-slate-100">{h.hospitalId}</p>
+            <div className="mt-1 flex items-center gap-2 text-xs">
+              {h.override && (
+                <span className={`rounded-full px-2 py-0.5 font-semibold ${statusBadgeColor(h.override)}`}>
+                  Override: {h.override}
+                </span>
+              )}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {statusOptions.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => onOverride(h.hospitalId, h.override === s ? null : s)}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
+                    h.override === s
+                      ? statusBadgeColor(s)
+                      : "border border-slate-700 bg-slate-800 text-slate-300 hover:border-slate-500"
+                  }`}
+                >
+                  {h.override === s ? `${s} ✓` : s}
+                </button>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -543,6 +613,15 @@ function requestStatusClass(status) {
   if (status === "accepted") return "border border-emerald-500/30 bg-emerald-500/10 text-emerald-200";
   if (status === "diverted") return "border border-red-500/30 bg-red-500/10 text-red-200";
   return "border border-amber-500/30 bg-amber-500/10 text-amber-200";
+}
+
+function statusBadgeColor(status) {
+  switch (status) {
+    case "Open": return "border border-emerald-500/30 bg-emerald-500/10 text-emerald-200";
+    case "Saturation": return "border border-amber-500/30 bg-amber-500/10 text-amber-200";
+    case "Diversion": return "border border-red-500/30 bg-red-500/10 text-red-200";
+    default: return "border border-slate-700 bg-slate-800 text-slate-300";
+  }
 }
 
 function getNodeColor(utilization) {

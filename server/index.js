@@ -7,6 +7,8 @@ import { Client } from "@googlemaps/google-maps-services-js";
 dotenv.config();
 
 const requests = {};
+const dispatches = {};
+const hospitalOverrides = {}; // { [hospitalId]: "Open" | "Saturation" | "Diversion" }
 
 const app = express();
 const googleMapsClient = new Client({});
@@ -16,7 +18,6 @@ const googleMapsApiKey = process.env.GOOGLE_MAPS_API_KEY;
 app.use(cors());
 app.use(express.json());
 
-// Keep only the most recent record per hospital_pk (Socrata returns multiple weeks)
 function deduplicateByLatestWeek(rawRecords) {
   const seen = new Map();
   for (const h of rawRecords) {
@@ -27,7 +28,6 @@ function deduplicateByLatestWeek(rawRecords) {
   return [...seen.values()];
 }
 
-// Helper function to fetch hospitals for the entire state and filter by distance
 async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
   try {
     const socrataUrl = new URL("https://healthdata.gov/resource/anag-cw7u.json");
@@ -47,12 +47,9 @@ async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
       const inpatientTotal = parseFloat(h.inpatient_beds_7_day_avg) || 1;
       const icuUsed = parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0;
       const icuTotal = parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 1;
-
       const hospitalLat = coords ? coords[1] : null;
       const hospitalLng = coords ? coords[0] : null;
-      const distance = hospitalLat && hospitalLng
-        ? haversineMiles(lat, lng, hospitalLat, hospitalLng)
-        : 999;
+      const distance = hospitalLat && hospitalLng ? haversineMiles(lat, lng, hospitalLat, hospitalLng) : 999;
 
       return {
         id: h.hospital_pk,
@@ -83,10 +80,9 @@ async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
   }
 }
 
-// Cache hospitals to avoid excessive API calls
 let cachedHospitals = [];
 let cacheTimestamp = 0;
-const CACHE_DURATION = 3600000; // 1 hour
+const CACHE_DURATION = 3600000;
 
 async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit = 150) {
   const now = Date.now();
@@ -224,15 +220,6 @@ app.get("/api/hospitals", async (req, res) => {
                 : 0,
             icu_total: parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 0,
             icu_used: parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0,
-            icu_utilization:
-              h.staffed_adult_icu_bed_occupancy_7_day_avg &&
-              h.total_staffed_adult_icu_beds_7_day_avg
-                ? Math.round(
-                    (parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) /
-                      parseFloat(h.total_staffed_adult_icu_beds_7_day_avg)) *
-                      100
-                  )
-                : 0,
           },
           collectionDate: h.collection_week,
         };
@@ -328,17 +315,14 @@ app.patch("/api/requests/:requestId", (req, res) => {
 });
 
 app.listen(port, () => {
-  console.log(`backend listening on http://localhost:${port}`);
+  console.log(`Vital-Route backend listening on http://localhost:${port}`);
 });
 
 async function computeRoute(origin, specification, insurance) {
   const allNodes = await fetchHospitalsByDistance(origin.lat, origin.lng, 50);
   const normalizedSpecification = normalizeSpecification(specification);
   const normalizedInsurance = normalizeInsurance(insurance);
-
-  // Google Distance Matrix allows max 25 destinations per request; nodes are pre-sorted by haversine
   const nodes = allNodes.slice(0, 25);
-
   const trafficResults = await getTravelMetrics(origin, nodes);
 
   const scored = nodes.map((node, index) => {
@@ -346,7 +330,7 @@ async function computeRoute(origin, specification, insurance) {
     const availableBeds = Math.round(node.beds.inpatient_total - node.beds.inpatient_used);
     const waitMins = Math.round(10 + node.beds.inpatient_utilization * 0.5);
     const utilization = node.beds.inpatient_utilization / 100;
-    const status = deriveStatus(utilization);
+    const status = getEffectiveStatus(node.id, utilization);
 
     return {
       ...node,
@@ -459,7 +443,6 @@ async function getTravelMetrics(origin, nodes) {
   });
 
   const matrixRow = response.data.rows?.[0]?.elements ?? [];
-
   return matrixRow.map((element, index) => {
     if (element.status !== "OK") {
       const node = nodes[index];
@@ -471,6 +454,56 @@ async function getTravelMetrics(origin, nodes) {
     const durationSource = element.duration_in_traffic?.value ?? element.duration?.value ?? 0;
     return { distanceMiles, durationMins: Math.round(durationSource / 60) };
   });
+}
+
+function createRequest(dispatch, chainIndex, escalatedFromName) {
+  const entry = dispatch.chain[chainIndex];
+  const autoApproved = shouldAutoApprove(entry.hospitalId, entry);
+  const requestId = randomUUID();
+  requests[requestId] = {
+    requestId,
+    dispatchId: dispatch.dispatchId,
+    chainIndex,
+    hospitalId: entry.hospitalId,
+    hospitalName: entry.hospitalName,
+    patientSpec: dispatch.patientSpec,
+    insurance: dispatch.insurance,
+    etaMins: entry.etaMins,
+    escalatedFrom: escalatedFromName ?? null,
+    status: autoApproved ? "accepted" : "pending",
+    autoApproved,
+    requestedAt: new Date().toISOString(),
+  };
+  return requestId;
+}
+
+function shouldAutoApprove(hospitalId, nodeMetrics) {
+  const override = hospitalOverrides[hospitalId];
+  const utilization = nodeMetrics?.utilization ?? 0;
+  const status = override ?? deriveStatus(utilization);
+  return status === "Open"
+    && (nodeMetrics?.availableBeds ?? 0) >= 5
+    && (nodeMetrics?.waitMins ?? 999) <= 60;
+}
+
+function getEffectiveStatus(hospitalId, utilization) {
+  return hospitalOverrides[hospitalId] ?? deriveStatus(utilization);
+}
+
+function deriveStatus(utilization) {
+  if (utilization >= 0.95) return "Diversion";
+  if (utilization >= 0.80) return "Saturation";
+  return "Open";
+}
+
+function scoreHospital(node, spec) {
+  const STATUS_MULTIPLIER = { Open: 1.0, Saturation: 0.5, Diversion: 0 };
+  const timeToTreatment = (node.durationMins + node.waitMins) || 1;
+  const specialty = spec
+    ? (node.centerTypes ?? []).includes(spec) ? 3.0 : 0.5
+    : 1.0;
+  const status = STATUS_MULTIPLIER[node.status] ?? 1.0;
+  return specialty * status * node.availableBeds / timeToTreatment;
 }
 
 function haversineMiles(lat1, lon1, lat2, lon2) {
