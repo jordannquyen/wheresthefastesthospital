@@ -12,12 +12,29 @@ import { useVoice } from "./hooks/useVoice.js";
 import { extractPatient } from "./lib/extractPatient.js";
 
 const isAdminMode = new URLSearchParams(window.location.search).has("admin");
-const centerGL = { lat: 20, lng: 0 };
-const defaultZoom = 2;
+const centerGL = { lat: 34.0522, lng: -118.2437 };
+const defaultZoom = 11;
 const mapContainerStyle = { width: "100%", height: "100%" };
 const mapsApiKey = import.meta.env.GOOGLE_MAPS_API_KEY;
 const mapsLibraries = ["places"];
 const rankLabels = ["1", "2", "3"];
+
+function buildPickedOverDiff(a, b) {
+  if (!a || !b) return "";
+  const parts = [];
+
+  if (a.durationMins != null && b.durationMins != null && b.durationMins > 0) {
+    const pct = Math.round(((b.durationMins - a.durationMins) / b.durationMins) * 100);
+    if (pct >= 10) parts.push(`${pct}% lower ETA`);
+  }
+
+  if (a.availableBeds != null && b.availableBeds != null) {
+    const delta = a.availableBeds - b.availableBeds;
+    if (delta >= 3) parts.push(`${delta} more open beds`);
+  }
+
+  return parts.join(", ");
+}
 
 function App() {
   const [nodes, setNodes] = useState([]);
@@ -678,7 +695,11 @@ function App() {
                     voice.isListening
                       ? "bg-red-500 text-white hover:bg-red-400"
                       : "bg-cyan-500 text-slate-950 hover:bg-cyan-400"
-                  } ${(!voiceEnabled || voice.isProcessing) ? "cursor-not-allowed opacity-60" : ""}`}
+                  } ${(!voiceEnabled || voice.isProcessing) ? "cursor-not-allowed opacity-60" : ""} ${
+                    !route && !voice.isListening && !voice.isProcessing && !voice.isSpeaking && voiceEnabled
+                      ? "ring-2 ring-cyan-400/60 animate-pulse"
+                      : ""
+                  }`}
                 >
                   <span className={`inline-block h-2.5 w-2.5 rounded-full ${voice.isListening ? "animate-pulse bg-white" : "bg-slate-950/60"}`} />
                   {voice.isListening
@@ -770,7 +791,7 @@ function App() {
 
               <section className="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4">
                 <h2 className="text-lg font-semibold">Top 3 Hospital Choices</h2>
-                {!route && <p className="mt-2 text-sm text-slate-300">Enter a location to get ranked recommendations.</p>}
+                {!route && <p className="mt-2 text-sm text-slate-300">Click anywhere on the map, type an address, or tap the mic to start.</p>}
                 {route && (
                   <div className="mt-2 space-y-3 text-sm">
                     <p className="rounded-md border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
@@ -799,6 +820,11 @@ function App() {
                           <p className="mt-1 text-xs text-slate-300">
                             {candidate.distanceMiles} mi | {candidate.availableBeds} beds avail | {Math.round(candidate.utilization * 100)}% util | {candidate.waitMins} min wait
                           </p>
+                          {index === 0 && route.top3[1] && buildPickedOverDiff(route.top3[0], route.top3[1]) && (
+                            <p className="mt-1 text-[11px] italic text-cyan-300/80">
+                              Picked over {route.top3[1].name}: {buildPickedOverDiff(route.top3[0], route.top3[1])}
+                            </p>
+                          )}
                         </div>
                         );
                       })}
