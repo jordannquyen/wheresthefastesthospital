@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  Circle,
   Autocomplete,
+  Circle,
   GoogleMap,
   InfoWindowF,
   MarkerF,
@@ -30,7 +30,6 @@ function App() {
   const [resolvedAddress, setResolvedAddress] = useState("");
   const [locationError, setLocationError] = useState("");
   const [insurance, setInsurance] = useState("");
-  const [addressAutocomplete, setAddressAutocomplete] = useState(null);
   const [activeTab, setActiveTab] = useState("emt");
   const [hospitalRequests, setHospitalRequests] = useState([]);
   const [sentRequests, setSentRequests] = useState({}); // { [hospitalId]: requestId }
@@ -41,10 +40,12 @@ function App() {
   const [adminHospitals, setAdminHospitals] = useState([]);
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [patientSummary, setPatientSummary] = useState(null);
-  const addressInputRef = useRef(null);
+  const [editingLocation, setEditingLocation] = useState(false);
+  const [locationDraft, setLocationDraft] = useState("");
   const mapRef = useRef(null);
   const originRef = useRef(origin);
   const prevDispatchRef = useRef(null);
+  const locationAutocompleteRef = useRef(null);
   const voice = useVoice();
 
   useEffect(() => {
@@ -64,47 +65,52 @@ function App() {
     libraries: mapsLibraries,
   });
 
-  // The autocomplete input is uncontrolled (so Google Places can write
-  // selected suggestions into it without React clobbering them on the next
-  // render). Mirror locationAddress onto the DOM ref so programmatic updates
-  // — voice geocode, GPS reverse-geocode — still appear in the field.
-  useEffect(() => {
-    if (!addressInputRef.current) return;
-    if (addressInputRef.current.value !== locationAddress) {
-      addressInputRef.current.value = locationAddress ?? "";
-    }
-  }, [locationAddress, isLoaded]);
-
   useEffect(() => {
     const pulseInterval = setInterval(() => setPulseTick((c) => !c), 900);
     return () => clearInterval(pulseInterval);
   }, []);
 
-  // Run once after Google Maps SDK is loaded: ask for GPS, reverse-geocode it,
-  // populate the address field, and route from there. Tracked with a ref so
-  // we don't re-run if isLoaded toggles.
+  // Run once after Google Maps SDK is loaded: attempt GPS, fall back to IP
+  // geolocation on failure (common on Mac when system permissions are denied).
   const didAutofillGpsRef = useRef(false);
   useEffect(() => {
     if (!isLoaded || didAutofillGpsRef.current) return;
-    if (!navigator.geolocation || !window.google?.maps?.Geocoder) return;
     didAutofillGpsRef.current = true;
 
-    navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-        const formatted = await reverseGeocode(loc);
-        const display = formatted ?? `${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}`;
-        setLocationAddress(display);
-        setResolvedAddress(display);
-        await fetchHospitalsByCoords(loc.lat, loc.lng);
-        await requestRecommendations(loc);
-      },
-      (err) => {
-        console.warn("Geolocation failed:", err);
-        setLocationError(`Couldn't get current location: ${err.message}`);
-      },
-      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 60_000 },
-    );
+    async function initLocation() {
+      let loc = null;
+
+      if (navigator.geolocation) {
+        loc = await new Promise((resolve) => {
+          navigator.geolocation.getCurrentPosition(
+            (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+            () => resolve(null),
+            { enableHighAccuracy: false, timeout: 6_000, maximumAge: 300_000 },
+          );
+        });
+      }
+
+      if (!loc) {
+        try {
+          const r = await fetch("https://ipapi.co/json/");
+          if (r.ok) {
+            const d = await r.json();
+            if (d.latitude && d.longitude) loc = { lat: d.latitude, lng: d.longitude };
+          }
+        } catch { /* ignore */ }
+      }
+
+      if (!loc) return;
+
+      const formatted = window.google?.maps?.Geocoder ? await reverseGeocode(loc) : null;
+      const display = formatted ?? `${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}`;
+      setLocationAddress(display);
+      setResolvedAddress(display);
+      await fetchHospitalsByCoords(loc.lat, loc.lng);
+      await requestRecommendations(loc);
+    }
+
+    initLocation();
   }, [isLoaded]);
 
   function reverseGeocode(loc) {
@@ -291,6 +297,39 @@ function App() {
     await requestRecommendations(clickOrigin);
   }
 
+  async function handleLocationPlaceChanged() {
+    const place = locationAutocompleteRef.current?.getPlace();
+    if (!place?.geometry?.location) return;
+    const loc = { lat: place.geometry.location.lat(), lng: place.geometry.location.lng() };
+    const display = place.formatted_address ?? locationDraft;
+    setResolvedAddress(display);
+    setLocationAddress(display);
+    setEditingLocation(false);
+    await fetchHospitalsByCoords(loc.lat, loc.lng);
+    await requestRecommendations(loc);
+  }
+
+  async function handleLocationManualSubmit() {
+    const draft = locationDraft.trim();
+    if (!draft) { setEditingLocation(false); return; }
+    try {
+      const res = await fetch("/api/geocode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: draft }),
+      });
+      const data = await res.json();
+      if (res.ok && data.location) {
+        const display = data.formattedAddress ?? draft;
+        setResolvedAddress(display);
+        setLocationAddress(display);
+        await fetchHospitalsByCoords(data.location.lat, data.location.lng);
+        await requestRecommendations(data.location);
+      }
+    } catch { /* ignore */ }
+    setEditingLocation(false);
+  }
+
   async function handleTalkToggle() {
     if (voice.isListening) {
       const transcript = await voice.stop();
@@ -301,7 +340,17 @@ function App() {
         return;
       }
 
-      const summary = extractPatient(transcript);
+      let summary;
+      try {
+        const extractRes = await fetch("/api/extract-patient", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ transcript }),
+        });
+        summary = extractRes.ok ? await extractRes.json() : extractPatient(transcript);
+      } catch {
+        summary = extractPatient(transcript);
+      }
       setPatientSummary(summary);
       if (summary.insurance) setInsurance(summary.insurance);
 
@@ -423,65 +472,6 @@ function App() {
     null;
   const selectedStats = getHospitalStats(selectedHospital);
 
-  async function handleLocationSubmit(event) {
-    event.preventDefault();
-    const addressValue = addressInputRef.current?.value?.trim() || locationAddress.trim();
-    if (!addressValue) { setLocationError("Enter an address to continue."); return; }
-
-    // Use Places Autocomplete geometry if available — avoids backend geocoder
-    if (addressAutocomplete) {
-      const place = addressAutocomplete.getPlace?.();
-      if (place?.geometry) {
-        const loc = place.geometry.location;
-        const selectedOrigin = {
-          lat: Number(loc.lat().toFixed(6)),
-          lng: Number(loc.lng().toFixed(6)),
-        };
-        const displayAddress = place.formatted_address || place.name || addressValue;
-        setLocationAddress(displayAddress);
-        setResolvedAddress(displayAddress);
-        setLocationError("");
-        await fetchHospitalsByCoords(selectedOrigin.lat, selectedOrigin.lng);
-        await requestRecommendations(selectedOrigin);
-        return;
-      }
-    }
-
-    // Fallback: backend geocoder
-    try {
-      setLocationError("");
-      const geoRes = await fetch("/api/geocode", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: addressValue }),
-      });
-      const geoData = await geoRes.json();
-      if (!geoRes.ok) { setLocationError(geoData.error ?? "Unable to resolve address."); return; }
-      setLocationAddress(geoData.formattedAddress ?? addressValue);
-      setResolvedAddress(geoData.formattedAddress ?? addressValue);
-      await fetchHospitalsByCoords(geoData.location.lat, geoData.location.lng);
-      await requestRecommendations(geoData.location);
-    } catch (_) {
-      setLocationError("Unable to geocode this address right now.");
-    }
-  }
-
-  async function handlePlaceChanged() {
-    if (!addressAutocomplete) return;
-    const place = addressAutocomplete.getPlace?.();
-    if (!place?.geometry) return;
-    const loc = place.geometry.location;
-    const selectedOrigin = {
-      lat: Number(loc.lat().toFixed(6)),
-      lng: Number(loc.lng().toFixed(6)),
-    };
-    setLocationAddress(place.formatted_address || place.name || "");
-    setResolvedAddress(place.formatted_address || place.name || "");
-    setLocationError("");
-    await fetchHospitalsByCoords(selectedOrigin.lat, selectedOrigin.lng);
-    await requestRecommendations(selectedOrigin);
-  }
-
   if (!mapsApiKey) {
     return (
       <main className="screen bg-grid text-slate-100">
@@ -505,7 +495,7 @@ function App() {
       <section className="mx-auto grid h-full w-full max-w-[1500px] grid-rows-[auto_auto_1fr] gap-4 p-4 lg:p-6">
         <header className="rounded-xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
           <h1 className="text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
-          <p className="mt-1 text-sm text-slate-300">a tool for emts to optimize saving lives</p>
+          <p className="mt-1 text-sm text-slate-300">optimize saving lives</p>
         </header>
 
         <nav className="flex gap-1 rounded-xl border border-slate-700 bg-slate-950/70 p-1">
@@ -628,11 +618,43 @@ function App() {
                 </GoogleMap>
               )}
 
+              {(resolvedAddress || editingLocation) && (
+                <div
+                  className={`absolute left-3 top-3 max-w-[280px] rounded-lg border border-slate-600/90 bg-slate-950/85 px-3 py-2 backdrop-blur transition-shadow ${editingLocation ? "ring-1 ring-cyan-500/60" : "cursor-pointer hover:border-slate-400/80"}`}
+                  onClick={!editingLocation ? () => { setLocationDraft(resolvedAddress); setEditingLocation(true); } : undefined}
+                >
+                  <p className="font-mono text-[10px] uppercase tracking-wide text-cyan-400">
+                    {editingLocation ? "Enter address" : "Current location"}
+                  </p>
+                  {editingLocation ? (
+                    <Autocomplete
+                      onLoad={(a) => { locationAutocompleteRef.current = a; }}
+                      onPlaceChanged={handleLocationPlaceChanged}
+                    >
+                      <input
+                        autoFocus
+                        value={locationDraft}
+                        onChange={(e) => setLocationDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") setEditingLocation(false);
+                          if (e.key === "Enter") handleLocationManualSubmit();
+                        }}
+                        onBlur={() => setTimeout(() => setEditingLocation(false), 200)}
+                        className="mt-0.5 w-full bg-transparent text-xs text-slate-200 outline-none border-b border-slate-500/70 pb-0.5 placeholder-slate-500"
+                        placeholder="Search address…"
+                      />
+                    </Autocomplete>
+                  ) : (
+                    <p className="mt-0.5 text-xs text-slate-200 leading-snug">{resolvedAddress}</p>
+                  )}
+                </div>
+              )}
+
               <div className="pointer-events-none absolute bottom-3 right-3 max-w-[240px] rounded-lg border border-slate-600/90 bg-slate-950/85 p-3 backdrop-blur">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-200">Legend</p>
                 <ul className="mt-2 space-y-1.5 text-xs text-slate-300">
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" />Green: &lt;50% util</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 50-97% util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" />Green: &lt;70% util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 70-96% util</li>
                   <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500" />Red pulse: 97%+ util</li>
                   <li><span className="mr-2 inline-block h-[2px] w-6 bg-sky-400 align-middle" />Top recommendation</li>
                   <li><span className="mr-2 inline-block h-[2px] w-6 border-b border-dashed border-slate-400 align-middle" />Closest baseline</li>
@@ -640,7 +662,7 @@ function App() {
               </div>
             </article>
 
-            <aside className="grid min-h-0 grid-rows-[auto_auto_auto_1fr] gap-4">
+            <aside className="flex min-h-0 flex-col gap-4">
               <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
                 <div className="flex items-center justify-between">
                   <h2 className="text-lg font-semibold">Voice Intake</h2>
@@ -648,9 +670,6 @@ function App() {
                     {voiceEnabled ? "ElevenLabs ready" : "voice offline"}
                   </span>
                 </div>
-                <p className="mt-1 text-sm text-slate-300">
-                  Tap the mic, describe the patient, then tap again to stop. Condition and vitals are extracted automatically.
-                </p>
                 <button
                   type="button"
                   onClick={handleTalkToggle}
@@ -661,7 +680,7 @@ function App() {
                       : "bg-cyan-500 text-slate-950 hover:bg-cyan-400"
                   } ${(!voiceEnabled || voice.isProcessing) ? "cursor-not-allowed opacity-60" : ""}`}
                 >
-                  <span className={`inline-block h-2.5 w-2.5 rounded-full ${voice.isListening ? "animate-pulse bg-white" : "bg-slate-950/60"}`}></span>
+                  <span className={`inline-block h-2.5 w-2.5 rounded-full ${voice.isListening ? "animate-pulse bg-white" : "bg-slate-950/60"}`} />
                   {voice.isListening
                     ? "Listening — tap to stop"
                     : voice.isProcessing
@@ -670,79 +689,58 @@ function App() {
                         ? "Speaking…"
                         : "Tap to talk"}
                 </button>
-                {voice.error && (
-                  <p className="mt-2 text-xs text-red-300">{voice.error}</p>
-                )}
-                {patientSummary && (
-                  <div className="mt-3 space-y-1.5 rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-200">
-                    <p className="font-mono uppercase tracking-wide text-cyan-300">Patient summary</p>
-                    {patientSummary.name && (
-                      <p>Name: <span className="font-semibold text-white">{patientSummary.name}</span></p>
-                    )}
-                    {(patientSummary.age || patientSummary.sex) && (
-                      <p>Demographics: {[patientSummary.age && `${patientSummary.age}y`, patientSummary.sex].filter(Boolean).join(", ")}</p>
-                    )}
-                    {patientSummary.specification && (
-                      <p>Suspected: <span className="font-semibold text-white">{patientSummary.specification.toUpperCase()}</span></p>
-                    )}
-                    {patientSummary.insurance && (
-                      <p>Insurance: <span className="font-semibold text-white">{patientSummary.insurance}</span></p>
-                    )}
-                    {patientSummary.location?.phrase && (
-                      <p>Location heard: <span className="font-semibold text-white">{patientSummary.location.phrase}</span></p>
-                    )}
-                    {(patientSummary.vitals.bp || patientSummary.vitals.hr || patientSummary.vitals.spo2) && (
-                      <p>Vitals: {[
-                        patientSummary.vitals.bp && `BP ${patientSummary.vitals.bp}`,
-                        patientSummary.vitals.hr && `HR ${patientSummary.vitals.hr}`,
-                        patientSummary.vitals.spo2 && `SpO₂ ${patientSummary.vitals.spo2}%`,
-                      ].filter(Boolean).join(" · ")}</p>
-                    )}
-                    {patientSummary.transcript && (
-                      <p className="mt-1 text-slate-400">"{patientSummary.transcript}"</p>
-                    )}
-                  </div>
-                )}
+                {voice.error && <p className="mt-2 text-xs text-red-300">{voice.error}</p>}
+                {resolvedAddress && <p className="mt-2 text-xs text-slate-500">Location: {resolvedAddress}</p>}
+                {locationError && <p className="mt-1 text-xs text-red-300">{locationError}</p>}
               </section>
 
-              <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-                <h2 className="text-lg font-semibold">Current Location</h2>
-                <p className="mt-1 text-sm text-slate-300">Use address autofill or click the map, then compute top 3 hospitals.</p>
-                <form className="mt-3 grid grid-cols-1 gap-2" onSubmit={handleLocationSubmit}>
-                  {isLoaded ? (
-                    <Autocomplete
-                      onLoad={(ac) => setAddressAutocomplete(ac)}
-                      onPlacesChanged={handlePlaceChanged}
-                      options={{ fields: ["formatted_address", "geometry", "name"], componentRestrictions: { country: "us" } }}
-                    >
-                      <input
-                        ref={addressInputRef}
-                        type="text"
-                        onChange={(e) => setLocationAddress(e.target.value)}
-                        className="w-full rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
-                        placeholder="Start typing an address"
-                      />
-                    </Autocomplete>
-                  ) : (
-                    <input
-                      type="text"
-                      value={locationAddress}
-                      onChange={(e) => setLocationAddress(e.target.value)}
-                      className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
-                      placeholder="Loading autocomplete..."
-                    />
-                  )}
-                  <select value={insurance} onChange={(e) => setInsurance(e.target.value)} className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
-                    <option value="">Insurance (any)</option>
-                    <option value="Government">Government (Medicare / Medicaid)</option>
-                    <option value="Kaiser">Kaiser Permanente</option>
-                  </select>
-                  <button type="submit" className="rounded-md bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400">
-                    Get Top 3 Hospitals
-                  </button>
-                </form>
-                {resolvedAddress && <p className="mt-2 text-xs text-cyan-300">Resolved: {resolvedAddress}</p>}
-                {locationError && <p className="mt-2 text-xs text-red-300">{locationError}</p>}
+              <section className="max-h-64 overflow-y-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4">
+                <h2 className="text-sm font-semibold text-slate-300">Call Transcript</h2>
+                {!voice.isListening && !voice.isProcessing && !patientSummary && (
+                  <p className="mt-2 text-xs text-slate-500">Transcript appears here after voice intake. Click the map to set location manually.</p>
+                )}
+                {voice.isListening && (
+                  <div className="mt-3 flex items-center gap-2">
+                    <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-red-400" />
+                    <span className="text-sm text-slate-300 animate-pulse">Recording…</span>
+                  </div>
+                )}
+                {voice.isProcessing && (
+                  <p className="mt-3 text-sm text-slate-400">Transcribing…</p>
+                )}
+                {patientSummary && (
+                  <div className="mt-2 space-y-1.5 text-xs text-slate-200">
+                    {patientSummary.transcript && (
+                      <p className="rounded-md border border-slate-700 bg-slate-900/60 p-2 italic leading-relaxed text-slate-300">
+                        "{patientSummary.transcript}"
+                      </p>
+                    )}
+                    <div className="mt-1 space-y-1 rounded-lg border border-slate-700/50 bg-slate-900/40 p-2">
+                      <p className="font-mono text-[10px] uppercase tracking-wide text-cyan-300">Extracted</p>
+                      {patientSummary.name && <p>Name: <span className="font-semibold text-white">{patientSummary.name}</span></p>}
+                      {(patientSummary.age || patientSummary.sex) && (
+                        <p>Demographics: {[patientSummary.age && `${patientSummary.age}y`, patientSummary.sex].filter(Boolean).join(", ")}</p>
+                      )}
+                      {patientSummary.chiefComplaint && <p>Complaint: <span className="font-semibold text-white">{patientSummary.chiefComplaint}</span></p>}
+                      {patientSummary.specification && <p>Suspected: <span className="font-semibold text-white">{patientSummary.specification.toUpperCase()}</span></p>}
+                      {patientSummary.mechanism && <p>Mechanism: <span className="font-semibold text-white">{patientSummary.mechanism}</span></p>}
+                      {patientSummary.insurance && <p>Insurance: <span className="font-semibold text-white">{patientSummary.insurance}</span></p>}
+                      {patientSummary.location?.phrase && <p>Location heard: <span className="font-semibold text-white">{patientSummary.location.phrase}</span></p>}
+                      {(patientSummary.vitals?.bp || patientSummary.vitals?.hr || patientSummary.vitals?.spo2 || patientSummary.vitals?.rr) && (
+                        <p>Vitals: {[
+                          patientSummary.vitals.bp && `BP ${patientSummary.vitals.bp}`,
+                          patientSummary.vitals.hr && `HR ${patientSummary.vitals.hr}`,
+                          patientSummary.vitals.spo2 && `SpO₂ ${patientSummary.vitals.spo2}%`,
+                          patientSummary.vitals.rr && `RR ${patientSummary.vitals.rr}`,
+                        ].filter(Boolean).join(" · ")}</p>
+                      )}
+                      {patientSummary.mentalStatus && <p>Mental status: <span className="font-semibold text-white">{patientSummary.mentalStatus}</span></p>}
+                      {patientSummary.interventions?.length > 0 && (
+                        <p>Interventions: <span className="font-semibold text-white">{patientSummary.interventions.join(", ")}</span></p>
+                      )}
+                    </div>
+                  </div>
+                )}
               </section>
 
               {selectedHospital && (
@@ -770,7 +768,7 @@ function App() {
                 </section>
               )}
 
-              <section className="min-h-0 overflow-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4">
+              <section className="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4">
                 <h2 className="text-lg font-semibold">Top 3 Hospital Choices</h2>
                 {!route && <p className="mt-2 text-sm text-slate-300">Enter a location to get ranked recommendations.</p>}
                 {route && (
@@ -937,6 +935,7 @@ function AdminView({ hospitals, onOverride }) {
 }
 
 function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFilter, onFilterChange }) {
+  const [reportReq, setReportReq] = useState(null);
   return (
     <section className="grid min-h-0 grid-rows-[auto_1fr] gap-4">
       <div className="flex flex-col gap-3 rounded-xl border border-slate-700 bg-slate-950/70 p-4 sm:flex-row sm:items-center sm:justify-between">
@@ -969,20 +968,13 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
                 <div className="mt-2 space-y-1 text-sm text-slate-300">
                   <p>ETA: <span className="text-slate-100">{req.etaMins != null ? `${req.etaMins} min` : "--"}</span></p>
                   {req.insurance && <p>Insurance: <span className="text-slate-100">{req.insurance}</span></p>}
-                  {req.patientSummary && (
-                    <div className="mt-2 rounded-lg border border-slate-700 bg-slate-950/60 p-2 space-y-0.5 text-xs">
-                      {req.patientSummary.name && <p>Patient: <span className="text-slate-100">{req.patientSummary.name}</span></p>}
-                      {(req.patientSummary.age || req.patientSummary.sex) && (
-                        <p>{[req.patientSummary.age ? `${req.patientSummary.age}y` : null, req.patientSummary.sex].filter(Boolean).join(", ")}</p>
-                      )}
-                      {req.patientSummary.vitals?.bp && <p>BP: <span className="text-slate-100">{req.patientSummary.vitals.bp}</span></p>}
-                      {req.patientSummary.vitals?.hr && <p>HR: <span className="text-slate-100">{req.patientSummary.vitals.hr} bpm</span></p>}
-                      {req.patientSummary.vitals?.spo2 && <p>SpO2: <span className="text-slate-100">{req.patientSummary.vitals.spo2}%</span></p>}
-                      {req.patientSummary.transcript && (
-                        <p className="mt-1 italic text-slate-400 leading-relaxed">"{req.patientSummary.transcript}"</p>
-                      )}
-                    </div>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => setReportReq(req)}
+                    className="mt-3 w-full rounded-md border border-cyan-500/30 bg-cyan-500/10 px-3 py-1.5 text-xs font-semibold text-cyan-300 transition hover:bg-cyan-500/20"
+                  >
+                    Patient Report
+                  </button>
                   <p className="font-mono text-xs text-slate-500">{new Date(req.requestedAt).toLocaleTimeString()}</p>
                 </div>
                 {req.status === "pending" && (
@@ -996,6 +988,97 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
           </div>
         )}
       </div>
+
+      {reportReq && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+          onClick={() => setReportReq(null)}
+        >
+          <div
+            className="relative max-h-[85vh] w-full max-w-md overflow-auto rounded-2xl border border-slate-600 bg-slate-900 p-6 shadow-2xl shadow-black/60"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              onClick={() => setReportReq(null)}
+              className="absolute right-4 top-4 text-xl leading-none text-slate-400 hover:text-white"
+            >
+              ×
+            </button>
+            <p className="font-mono text-[10px] uppercase tracking-wide text-cyan-400">Patient Report</p>
+            <p className="mt-0.5 text-base font-semibold text-slate-100">{reportReq.hospitalName}</p>
+            <p className="mb-4 text-xs text-slate-400">{new Date(reportReq.requestedAt).toLocaleString()}</p>
+
+            <div className="space-y-4 text-sm">
+              {(reportReq.patientSummary?.name || reportReq.patientSummary?.age || reportReq.patientSummary?.sex) && (
+                <div>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Patient</p>
+                  {reportReq.patientSummary.name && <p className="font-semibold text-white">{reportReq.patientSummary.name}</p>}
+                  {(reportReq.patientSummary.age || reportReq.patientSummary.sex) && (
+                    <p className="text-slate-300">{[reportReq.patientSummary.age && `${reportReq.patientSummary.age}yo`, reportReq.patientSummary.sex].filter(Boolean).join(", ")}</p>
+                  )}
+                </div>
+              )}
+              {(reportReq.patientSummary?.chiefComplaint || reportReq.patientSummary?.specification) && (
+                <div>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Chief Complaint</p>
+                  <p className="text-slate-100">{reportReq.patientSummary.chiefComplaint ?? reportReq.patientSummary.specification?.toUpperCase()}</p>
+                </div>
+              )}
+              {reportReq.patientSummary?.mechanism && (
+                <div>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Mechanism of Injury / Illness</p>
+                  <p className="text-slate-100">{reportReq.patientSummary.mechanism}</p>
+                </div>
+              )}
+              {(reportReq.patientSummary?.vitals?.bp || reportReq.patientSummary?.vitals?.hr || reportReq.patientSummary?.vitals?.spo2 || reportReq.patientSummary?.vitals?.rr) && (
+                <div>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Vital Signs</p>
+                  <div className="grid grid-cols-2 gap-x-6 gap-y-1 text-slate-100">
+                    {reportReq.patientSummary.vitals.bp && <p>BP <span className="font-medium text-white">{reportReq.patientSummary.vitals.bp}</span></p>}
+                    {reportReq.patientSummary.vitals.hr && <p>HR <span className="font-medium text-white">{reportReq.patientSummary.vitals.hr} bpm</span></p>}
+                    {reportReq.patientSummary.vitals.spo2 && <p>SpO₂ <span className="font-medium text-white">{reportReq.patientSummary.vitals.spo2}%</span></p>}
+                    {reportReq.patientSummary.vitals.rr && <p>RR <span className="font-medium text-white">{reportReq.patientSummary.vitals.rr}/min</span></p>}
+                  </div>
+                </div>
+              )}
+              {reportReq.patientSummary?.mentalStatus && (
+                <div>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Mental Status</p>
+                  <p className="text-slate-100">{reportReq.patientSummary.mentalStatus}</p>
+                </div>
+              )}
+              {reportReq.patientSummary?.interventions?.length > 0 && (
+                <div>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Interventions & Response</p>
+                  <ul className="list-inside list-disc space-y-0.5 text-slate-100">
+                    {reportReq.patientSummary.interventions.map((i) => <li key={i}>{i}</li>)}
+                  </ul>
+                </div>
+              )}
+              <div>
+                <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">ETA</p>
+                <p className="text-slate-100">{reportReq.etaMins != null ? `${reportReq.etaMins} min` : "—"}</p>
+              </div>
+              {reportReq.insurance && (
+                <div>
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Insurance</p>
+                  <p className="text-slate-100">{reportReq.insurance}</p>
+                </div>
+              )}
+              {!reportReq.patientSummary && (
+                <p className="text-slate-400">No detailed patient information available for this request.</p>
+              )}
+              {reportReq.patientSummary?.transcript && (
+                <div className="border-t border-slate-700 pt-3">
+                  <p className="mb-1 text-[10px] uppercase tracking-wide text-slate-500">Call Transcript</p>
+                  <p className="text-xs italic leading-relaxed text-slate-400">"{reportReq.patientSummary.transcript}"</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }
@@ -1034,7 +1117,7 @@ function statusBadgeColor(status) {
 
 function getNodeColor(utilization) {
   if (utilization >= 0.97) return "#ef4444";
-  if (utilization >= 0.5) return "#f59e0b";
+  if (utilization >= 0.70) return "#f59e0b";
   return "#34d399";
 }
 

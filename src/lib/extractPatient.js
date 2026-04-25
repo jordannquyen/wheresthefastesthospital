@@ -3,22 +3,17 @@
  *
  * Schema returned:
  *   {
- *     name:           string | null,        // patient name if mentioned
+ *     name:           string | null,
  *     age:            number | null,
  *     sex:            "male" | "female" | null,
  *     specification:  "stemi" | "stroke" | "trauma" | null,
- *                                           // informational only — passed to
- *                                           // /api/patients for the receiving
- *                                           // hospital and shown in the patient
- *                                           // summary card. NOT a routing
- *                                           // filter (main went insurance-only).
- *     insurance:      "Medicare" | "Medicaid" | "Blue Cross" | "Aetna"
- *                   | "United Healthcare" | "Cigna" | "Kaiser" | null,
- *                                           // routing filter via POST /api/route
+ *     insurance:      "Government" | "Kaiser" | null,
  *     location:       { phrase: string } | null,
- *                                           // free-text — geocode upstream
- *                                           // before posting lat/lng to /api
- *     vitals:         { bp: string|null, hr: number|null, spo2: number|null },
+ *     chiefComplaint: string | null,        // primary presenting problem
+ *     mechanism:      string | null,        // mechanism of injury/illness
+ *     mentalStatus:   string | null,        // GCS score or AVPU level
+ *     interventions:  string[] | null,      // treatments already applied
+ *     vitals:         { bp: string|null, hr: number|null, spo2: number|null, rr: number|null },
  *     transcript:     string,
  *   }
  *
@@ -31,23 +26,36 @@
 const SPEC_KEYWORDS = {
   stemi: [
     "stemi",
+    "st elevation",
     "heart attack",
     "myocardial infarction",
     "chest pain",
+    "chest pressure",
     "chest tightness",
+    "crushing chest",
     "cardiac arrest",
     "cardiac",
     "mi ",
+    "v-fib",
+    "ventricular fibrillation",
   ],
   stroke: [
     "stroke",
     "facial droop",
+    "face drooping",
     "slurred speech",
     "slurring",
+    "can't speak",
+    "difficulty speaking",
+    "trouble speaking",
     "cva",
     "hemiparesis",
     "last known well",
     "weakness on one side",
+    "one-sided weakness",
+    "arm weakness",
+    "sudden headache",
+    "vision changes",
   ],
   trauma: [
     "trauma",
@@ -61,6 +69,10 @@ const SPEC_KEYWORDS = {
     "fall from",
     "ejection",
     "blunt force",
+    "head injury",
+    "head trauma",
+    "penetrating",
+    "crush injury",
   ],
 };
 
@@ -68,12 +80,7 @@ const SPEC_KEYWORDS = {
 // Ordered so that more-specific phrases (e.g. "blue cross blue shield") are
 // looked for before shorter substrings.
 const INSURANCE_KEYWORDS = {
-  Medicare: ["medicare"],
-  Medicaid: ["medicaid", "medi-cal", "medi cal"],
-  "Blue Cross": ["blue cross blue shield", "blue cross", "bcbs", "anthem"],
-  Aetna: ["aetna"],
-  "United Healthcare": ["united healthcare", "unitedhealthcare", "unitedhealth", "uhc"],
-  Cigna: ["cigna"],
+  Government: ["medicare", "medicaid", "medi-cal", "medi cal", "government insurance"],
   Kaiser: ["kaiser permanente", "kaiser"],
 };
 
@@ -122,6 +129,10 @@ export function extractPatient(rawTranscript) {
     specification: pickByLastOccurrence(lower, SPEC_KEYWORDS),
     insurance: pickByLastOccurrence(lower, INSURANCE_KEYWORDS),
     location: extractLocation(transcript),
+    chiefComplaint: extractChiefComplaint(transcript),
+    mechanism: extractMechanism(lower),
+    mentalStatus: extractMentalStatus(transcript),
+    interventions: extractInterventions(lower),
     vitals: extractVitals(transcript),
     transcript: transcript.trim(),
   };
@@ -195,5 +206,88 @@ function extractVitals(transcript) {
   const spo2Match = transcript.match(/\b(?:spo2|sp02|sat|sats|oxygen|o2)\s*(?:is|of|at)?\s*(\d{2,3})\b/i);
   const spo2 = spo2Match ? Number(spo2Match[1]) : null;
 
-  return { bp, hr, spo2 };
+  const rrMatch = transcript.match(/\b(?:resp(?:iratory)?\s+rate|rr|respirations?)\s*(?:is|of|at)?\s*(\d{1,3})\b/i);
+  const rr = rrMatch ? Number(rrMatch[1]) : null;
+
+  return { bp, hr, spo2, rr };
+}
+
+function extractChiefComplaint(transcript) {
+  const patterns = [
+    // Explicit formal phrases
+    /\b(?:chief\s+complaint|presenting\s+complaint|c\/c)\s*(?:is\s*|:\s*)?(.+?)(?:[.,;]|\band\b|$)/i,
+    /\b(?:complaining\s+of|c\/o|presents?\s+with|presented?\s+with)\s+(.+?)(?:[.,;]|\band\b|$)/i,
+    /\bpatient\s+(?:is\s+experiencing|is\s+having|reports?)\s+(.+?)(?:[.,;]|$)/i,
+    // "patient has [a/an] ..."
+    /\bpatient\s+has\s+(?:a\s+|an\s+)?(.+?)(?:[.,;]|$)/i,
+    // "suffering from", "found with / found having", "with complaints of"
+    /\b(?:suffering\s+from|found\s+(?:with|having)|with\s+complaints?\s+of)\s+(.+?)(?:[.,;]|$)/i,
+    // Most common informal EMT pattern: "45-year-old male, [complaint]"
+    /\b\d+[- ]?(?:year[- ]?old|y\/o|yo)\s+(?:male|female|man|woman)\s*,\s*(.+?)(?:[.,;]|$)/i,
+    // "we've got / we have a [patient/male/female] with ..."
+    /\bwe(?:'ve|\s+have)\s+(?:got\s+)?(?:a\s+)?(?:\w+\s+){0,4}with\s+(.+?)(?:[.,;]|$)/i,
+    // "brought in for", "calling for", "responding to a"
+    /\b(?:brought\s+in\s+for|calling\s+for|responding\s+to\s+a(?:n)?)\s+(.+?)(?:[.,;]|$)/i,
+    // "he/she/they is/are [condition]" — e.g. "she is unresponsive"
+    /\b(?:he|she|they)\s+(?:is|are)\s+(.+?)(?:[.,;]|$)/i,
+  ];
+  for (const p of patterns) {
+    const m = transcript.match(p);
+    const phrase = m?.[1]?.trim();
+    if (phrase && phrase.length >= 3 && phrase.length <= 100) {
+      return phrase.replace(/\.$/, "").trim();
+    }
+  }
+  return null;
+}
+
+function extractMechanism(lowerTranscript) {
+  const checks = [
+    [/\bgsw\b|gunshot\s+wound/, "GSW"],
+    [/\bstabbing\b|\bstab\s+wound/, "stab wound"],
+    [/\bmvc\b|motor\s+vehicle\s+(?:crash|accident|collision)/, "MVC"],
+    [/\bfall(?:ing|en)?\s+from\b/, "fall"],
+    [/\bejection\b/, "ejection from vehicle"],
+    [/\bblunt\s+force\b/, "blunt force trauma"],
+    [/\bcardiac\s+arrest\b/, "cardiac arrest"],
+    [/\bheart\s+attack\b|\bmyocardial\s+infarction\b/, "acute MI"],
+    [/\bstemi\b/, "STEMI"],
+    [/\bstroke\b|\bcva\b/, "stroke / CVA"],
+    [/\bseizure/, "seizure"],
+    [/\boverdose\b/, "overdose"],
+  ];
+  for (const [re, label] of checks) {
+    if (re.test(lowerTranscript)) return label;
+  }
+  return null;
+}
+
+function extractMentalStatus(transcript) {
+  const gcs = transcript.match(/\b(?:gcs|glasgow\s+coma\s+(?:scale|score)?)\s*(?:of\s*|is\s*|score\s*)?(\d{1,2})\b/i);
+  if (gcs) return `GCS ${gcs[1]}`;
+  const avpu = transcript.match(
+    /\b(alert(?:\s+and\s+oriented(?:\s+(?:x|times)\s*\d)?)?|a&ox\d|unresponsive|unconscious|confused|disoriented|lethargic)\b/i
+  );
+  return avpu ? avpu[1] : null;
+}
+
+function extractInterventions(lowerTranscript) {
+  const checks = [
+    [/\bcpr\b|\bcompressions?\b/, "CPR"],
+    [/\bintubat/, "intubated"],
+    [/\b(?:o2|oxygen|non-rebreather|nasal\s+cannula)/, "O2"],
+    [/\btourniquet/, "tourniquet"],
+    [/\biv\s+(?:access|line|established|started)|iv\s+access/, "IV access"],
+    [/\baspirin/, "aspirin"],
+    [/\bnitro(?:glycerin)?/, "nitroglycerin"],
+    [/\bepinephrine\b|\bepi\b/, "epinephrine"],
+    [/\bnarcan\b|\bnaloxone/, "naloxone"],
+    [/\bdefib(?:rillat)?/, "defibrillation"],
+    [/\bspinal\s+immobilization|c-collar|cervical\s+collar/, "spinal immobilization"],
+  ];
+  const found = [];
+  for (const [re, label] of checks) {
+    if (re.test(lowerTranscript)) found.push(label);
+  }
+  return found.length > 0 ? found : null;
 }
