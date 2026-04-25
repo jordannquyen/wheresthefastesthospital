@@ -444,6 +444,7 @@ Field rules:
 - chiefComplaint: primary presenting problem in plain language (NOT insurance, NOT demographics)
 - summary: one concise clinical summary sentence
 - confidence: number from 0 to 1 for extraction confidence
+- sex: ONLY set if the transcript explicitly uses "he", "him", "his", "she", "her", "male", "female", "man", or "woman". Do NOT infer from names.
 
 Transcript: ${JSON.stringify(transcript)}`;
 
