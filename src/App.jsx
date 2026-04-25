@@ -58,6 +58,14 @@ function App() {
       .catch(() => setVoiceEnabled(false));
   }, []);
 
+  // Keep the (uncontrolled) autocomplete input in sync with locationAddress
+  // so voice-resolved or programmatically set addresses appear in the field.
+  useEffect(() => {
+    if (addressInputRef.current && addressInputRef.current.value !== locationAddress) {
+      addressInputRef.current.value = locationAddress ?? "";
+    }
+  }, [locationAddress]);
+
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
     googleMapsApiKey: mapsApiKey || "",
@@ -74,10 +82,23 @@ function App() {
     navigator.geolocation.getCurrentPosition(async (pos) => {
       const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
       setResolvedAddress("Current location");
+      reverseGeocodeToField(loc);
       await fetchHospitalsByCoords(loc.lat, loc.lng);
       await requestRecommendations(loc);
     });
-  }, []);
+  }, [isLoaded]);
+
+  function reverseGeocodeToField(loc) {
+    if (!isLoaded || !window.google?.maps?.Geocoder) return;
+    const geocoder = new window.google.maps.Geocoder();
+    geocoder.geocode({ location: loc }, (results, status) => {
+      if (status === "OK" && results?.[0]) {
+        const formatted = results[0].formatted_address;
+        setLocationAddress(formatted);
+        setResolvedAddress(formatted);
+      }
+    });
+  }
 
   // Poll hospital requests while on hospital tab
   useEffect(() => {
