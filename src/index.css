@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Nunito+Sans:opsz,wght@6..12,400;6..12,600;6..12,700&family=IBM+Plex+Mono:wght@400;500&display=swap");
 
 @tailwind base;
 @tailwind components;
@@ -13,8 +13,8 @@ body,
 }
 
 body {
-  font-family: "Space Grotesk", sans-serif;
-  background: #030711;
+  font-family: "Nunito Sans", sans-serif;
+  background: #29335c;
 }
 
 .screen {
@@ -23,8 +23,8 @@ body {
 
 .bg-grid {
   background:
-    radial-gradient(circle at 12% 8%, rgba(34, 211, 238, 0.15), transparent 28%),
-    radial-gradient(circle at 84% 14%, rgba(14, 165, 233, 0.12), transparent 35%),
-    radial-gradient(circle at 60% 90%, rgba(251, 146, 60, 0.09), transparent 35%),
-    linear-gradient(170deg, #040711 0%, #070d1c 45%, #060914 100%);
+    radial-gradient(circle at 12% 8%, rgba(34, 211, 238, 0.10), transparent 28%),
+    radial-gradient(circle at 84% 14%, rgba(14, 165, 233, 0.08), transparent 35%),
+    radial-gradient(circle at 60% 90%, rgba(251, 146, 60, 0.06), transparent 35%),
+    linear-gradient(170deg, #212952 0%, #29335c 50%, #1f2849 100%);
 }
