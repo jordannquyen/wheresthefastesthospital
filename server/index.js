@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import multer from "multer";
 import { Client } from "@googlemaps/google-maps-services-js";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
+import { MongoClient } from "mongodb";
 
 dotenv.config();
 
@@ -27,8 +28,88 @@ const uploadAudio = multer({
 });
 const defaultVoiceId = process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
 
+const mongoUri = process.env.MONGODB_URI;
+const mongoDbName = process.env.MONGODB_DB_NAME;
+
+let mongoClient = null;
+let patientsCollection = null;
+
 app.use(cors());
 app.use(express.json());
+
+function getPatientsCollectionOrNull() {
+  return patientsCollection;
+}
+
+async function initializeMongo() {
+  if (!mongoUri || !mongoDbName) {
+    console.warn("MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME to enable patient persistence.");
+    return;
+  }
+
+  mongoClient = new MongoClient(mongoUri);
+  await mongoClient.connect();
+  const db = mongoClient.db(mongoDbName);
+  patientsCollection = db.collection("patients");
+
+  await patientsCollection.createIndexes([
+    { key: { patientId: 1 }, unique: true },
+    { key: { status: 1 } },
+    { key: { specification: 1 } },
+    { key: { createdAt: -1 } },
+  ]);
+
+  console.log(`Connected to MongoDB Atlas database: ${mongoDbName}`);
+}
+
+function normalizePatientInput(body, { allowPartial = false } = {}) {
+  const next = {};
+
+  if (body.name !== undefined || !allowPartial) {
+    if (typeof body.name !== "string" || !body.name.trim()) {
+      return { error: "name is required and must be a non-empty string" };
+    }
+    next.name = body.name.trim();
+  }
+
+  if (body.age !== undefined || !allowPartial) {
+    if (typeof body.age !== "number" || !Number.isFinite(body.age) || body.age < 0) {
+      return { error: "age is required and must be a non-negative number" };
+    }
+    next.age = Math.floor(body.age);
+  }
+
+  if (body.specification !== undefined || !allowPartial) {
+    if (typeof body.specification !== "string" || !body.specification.trim()) {
+      return { error: "specification is required and must be a non-empty string" };
+    }
+    next.specification = body.specification.trim().toLowerCase();
+  }
+
+  if (body.location !== undefined || !allowPartial) {
+    if (
+      !body.location
+      || typeof body.location !== "object"
+      || typeof body.location.lat !== "number"
+      || typeof body.location.lng !== "number"
+    ) {
+      return { error: "location is required and must contain numeric lat and lng" };
+    }
+    next.location = {
+      lat: body.location.lat,
+      lng: body.location.lng,
+    };
+  }
+
+  if (body.status !== undefined || !allowPartial) {
+    if (typeof body.status !== "string" || !body.status.trim()) {
+      return { error: "status is required and must be a non-empty string" };
+    }
+    next.status = body.status.trim();
+  }
+
+  return { value: next };
+}
 
 function toTitleCase(str) {
   if (!str) return str;
@@ -172,7 +253,91 @@ app.get("/api/health", (_req, res) => {
     ok: true,
     provider: googleMapsApiKey ? "google" : "fallback",
     voice: Boolean(elevenlabs),
+    mongo: getPatientsCollectionOrNull() ? "connected" : "not-configured",
   });
+});
+
+// --- Patient endpoints ---
+
+app.post("/api/patients", async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) {
+    return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
+  }
+
+  const normalized = normalizePatientInput(req.body ?? {}, { allowPartial: false });
+  if (normalized.error) return res.status(400).json({ error: normalized.error });
+
+  const now = new Date().toISOString();
+  const patient = {
+    patientId: randomUUID(),
+    ...normalized.value,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  await collection.insertOne(patient);
+  const { _id, ...safePatient } = patient;
+  return res.status(201).json({ patient: safePatient });
+});
+
+app.get("/api/patients", async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) {
+    return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
+  }
+
+  const { status, specification } = req.query;
+  const filter = {};
+  if (typeof status === "string" && status.trim()) filter.status = status.trim();
+  if (typeof specification === "string" && specification.trim()) {
+    filter.specification = specification.trim().toLowerCase();
+  }
+
+  const patients = await collection
+    .find(filter, { projection: { _id: 0 } })
+    .sort({ createdAt: -1 })
+    .limit(200)
+    .toArray();
+
+  return res.json({ patients, count: patients.length });
+});
+
+app.get("/api/patients/:patientId", async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) {
+    return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
+  }
+
+  const patient = await collection.findOne(
+    { patientId: req.params.patientId },
+    { projection: { _id: 0 } }
+  );
+  if (!patient) return res.status(404).json({ error: "patient not found" });
+  return res.json({ patient });
+});
+
+app.patch("/api/patients/:patientId", async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) {
+    return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
+  }
+
+  const normalized = normalizePatientInput(req.body ?? {}, { allowPartial: true });
+  if (normalized.error) return res.status(400).json({ error: normalized.error });
+  if (Object.keys(normalized.value).length === 0) {
+    return res.status(400).json({ error: "No updatable patient fields were provided" });
+  }
+
+  const updates = { ...normalized.value, updatedAt: new Date().toISOString() };
+  const result = await collection.findOneAndUpdate(
+    { patientId: req.params.patientId },
+    { $set: updates },
+    { returnDocument: "after", projection: { _id: 0 } }
+  );
+
+  if (!result) return res.status(404).json({ error: "patient not found" });
+  return res.json({ patient: result });
 });
 
 app.get("/api/nodes", async (req, res) => {
@@ -472,9 +637,16 @@ app.get("/api/admin/overrides", (_req, res) => {
   return res.json({ overrides: hospitalOverrides });
 });
 
-app.listen(port, () => {
-  console.log(`Vital-Route backend listening on http://localhost:${port}`);
-});
+initializeMongo()
+  .then(() => {
+    app.listen(port, () => {
+      console.log(`Vital-Route backend listening on http://localhost:${port}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Failed to initialize MongoDB", error);
+    process.exit(1);
+  });
 
 // --- Routing pipeline ---
 

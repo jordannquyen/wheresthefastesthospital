@@ -43,6 +43,13 @@ Vital-Route is a healthcare network routing demo that treats patients as packets
 	- body: { "address": "200 N Spring St, Los Angeles" }
 - POST /api/route
 	- body: { "origin": { "lat": 34.02, "lng": -118.49 }, "specification": "stemi|stroke|trauma" (optional) }
+- POST /api/patients
+	- body: { "name": "Jane Doe", "age": 47, "specification": "stroke", "location": { "lat": 34.05, "lng": -118.24 }, "status": "active" }
+- GET /api/patients
+	- optional query params: status, specification
+- GET /api/patients/:patientId
+- PATCH /api/patients/:patientId
+	- body: any subset of name, age, specification, location, status
 
 ## Setup
 
@@ -58,9 +65,15 @@ npm install
 cp .env.example .env
 ```
 
-3. Add API keys in .env:
+3. Add environment variables in .env:
 
 - GOOGLE_MAPS_API_KEY
+- MONGODB_URI
+- MONGODB_DB_NAME
+
+Mongo notes:
+- Patient endpoints require MongoDB Atlas. If Mongo vars are missing, patient routes return HTTP 503.
+- MONGODB_DB_NAME is the database name inside your Atlas cluster, for example vital_route.
 
 4. Start frontend + backend:
 
