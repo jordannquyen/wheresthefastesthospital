@@ -39,6 +39,7 @@ function App() {
   const [dispatch, setDispatch] = useState(null);
   const [adminHospitals, setAdminHospitals] = useState([]);
   const addressInputRef = useRef(null);
+  const mapRef = useRef(null);
 
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
@@ -107,6 +108,10 @@ function App() {
         setNodes(data.nodes ?? []);
         setMapCenter({ lat, lng });
         setMapZoom(10.5);
+        if (mapRef.current) {
+          mapRef.current.panTo({ lat, lng });
+          mapRef.current.setZoom(10.5);
+        }
       }
     } catch (err) {
       console.error(err);
@@ -341,6 +346,7 @@ function App() {
                   center={mapCenter}
                   zoom={mapZoom}
                   options={mapOptions}
+                  onLoad={(map) => { mapRef.current = map; }}
                   onClick={handleMapClick}
                 >
                   {nodes.map((node) => {
