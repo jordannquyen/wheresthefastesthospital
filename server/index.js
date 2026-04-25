@@ -139,6 +139,8 @@ async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit 
   }
 }
 
+// --- Core endpoints ---
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, provider: googleMapsApiKey ? "google" : "fallback" });
 });
@@ -270,7 +272,59 @@ app.post("/api/route", async (req, res) => {
   }
 });
 
-// --- EMT request endpoints ---
+// --- Dispatch endpoints ---
+
+app.post("/api/dispatch", (req, res) => {
+  const { chain, patientSpec, insurance } = req.body ?? {};
+  if (!Array.isArray(chain) || chain.length === 0) {
+    return res.status(400).json({ error: "chain must be a non-empty array" });
+  }
+
+  const dispatchId = randomUUID();
+  const dispatch = {
+    dispatchId,
+    chain,
+    currentIndex: 0,
+    patientSpec: patientSpec ?? null,
+    insurance: insurance ?? null,
+    activeRequestId: null,
+    status: "active",
+    createdAt: new Date().toISOString(),
+  };
+  dispatches[dispatchId] = dispatch;
+
+  const requestId = createRequest(dispatch, 0, null);
+  dispatch.activeRequestId = requestId;
+  if (requests[requestId].status === "accepted") dispatch.status = "accepted";
+
+  return res.json({ dispatchId, requestId, status: requests[requestId].status, autoApproved: requests[requestId].autoApproved });
+});
+
+app.get("/api/dispatch/:dispatchId", (req, res) => {
+  const dispatch = dispatches[req.params.dispatchId];
+  if (!dispatch) return res.status(404).json({ error: "dispatch not found" });
+
+  const activeRequest = requests[dispatch.activeRequestId] ?? null;
+  const chainWithStatus = dispatch.chain.map((entry, index) => {
+    const r = Object.values(requests).find(
+      (r) => r.dispatchId === dispatch.dispatchId && r.chainIndex === index
+    );
+    return { ...entry, requestStatus: r?.status ?? null, requestId: r?.requestId ?? null };
+  });
+
+  return res.json({
+    dispatchId: dispatch.dispatchId,
+    status: dispatch.status,
+    currentIndex: dispatch.currentIndex,
+    currentHospital: dispatch.chain[dispatch.currentIndex] ?? null,
+    activeRequest,
+    chain: chainWithStatus,
+    patientSpec: dispatch.patientSpec,
+    insurance: dispatch.insurance,
+  });
+});
+
+// --- Request endpoints ---
 
 app.get("/api/requests", (req, res) => {
   const { hospitalId } = req.query;
@@ -280,43 +334,64 @@ app.get("/api/requests", (req, res) => {
   res.json({ requests: result });
 });
 
-app.post("/api/requests", (req, res) => {
-  const { hospitalId, hospitalName, patientSpec, insurance, etaMins } = req.body ?? {};
-  if (!hospitalId || !hospitalName) {
-    return res.status(400).json({ error: "hospitalId and hospitalName are required" });
-  }
-  const requestId = randomUUID();
-  const autoApproved = shouldAutoApprove(hospitalId);
-  const entry = {
-    requestId,
-    hospitalId,
-    hospitalName,
-    patientSpec: patientSpec || null,
-    insurance: insurance || null,
-    etaMins: etaMins ?? null,
-    status: autoApproved ? "accepted" : "pending",
-    autoApproved,
-    requestedAt: new Date().toISOString(),
-  };
-  requests[requestId] = entry;
-  res.json({ requestId, autoApproved, status: entry.status });
-});
-
 app.patch("/api/requests/:requestId", (req, res) => {
   const { requestId } = req.params;
   const { status } = req.body ?? {};
-  const entry = requests[requestId];
-  if (!entry) return res.status(404).json({ error: "Request not found" });
-  if (!["accepted", "diverted"].includes(status)) {
-    return res.status(400).json({ error: "status must be 'accepted' or 'diverted'" });
+  const record = requests[requestId];
+
+  if (!record) return res.status(404).json({ error: "request not found" });
+  if (record.status !== "pending") return res.status(409).json({ error: "request already resolved" });
+  if (status !== "accepted" && status !== "diverted") {
+    return res.status(400).json({ error: "status must be accepted or diverted" });
   }
-  entry.status = status;
-  res.json({ requestId, status });
+
+  record.status = status;
+
+  const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
+  if (dispatch) {
+    if (status === "accepted") {
+      dispatch.status = "accepted";
+    } else if (status === "diverted") {
+      const nextIndex = dispatch.currentIndex + 1;
+      if (nextIndex < dispatch.chain.length) {
+        dispatch.currentIndex = nextIndex;
+        const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
+        dispatch.activeRequestId = nextRequestId;
+        if (requests[nextRequestId].status === "accepted") dispatch.status = "accepted";
+      } else {
+        dispatch.status = "exhausted";
+      }
+    }
+  }
+
+  return res.json({ ok: true, requestId, status, dispatch: dispatch ?? null });
+});
+
+// --- Admin override endpoints ---
+
+app.post("/api/admin/override", (req, res) => {
+  const { hospitalId, status } = req.body ?? {};
+  if (!["Open", "Saturation", "Diversion"].includes(status)) {
+    return res.status(400).json({ error: "status must be Open, Saturation, or Diversion" });
+  }
+  hospitalOverrides[hospitalId] = status;
+  return res.json({ ok: true, hospitalId, status });
+});
+
+app.delete("/api/admin/override/:hospitalId", (req, res) => {
+  delete hospitalOverrides[req.params.hospitalId];
+  return res.json({ ok: true, hospitalId: req.params.hospitalId });
+});
+
+app.get("/api/admin/overrides", (_req, res) => {
+  return res.json({ overrides: hospitalOverrides });
 });
 
 app.listen(port, () => {
   console.log(`Vital-Route backend listening on http://localhost:${port}`);
 });
+
+// --- Routing pipeline ---
 
 async function computeRoute(origin, specification, insurance) {
   const allNodes = await fetchHospitalsByDistance(origin.lat, origin.lng, 50);
@@ -343,10 +418,8 @@ async function computeRoute(origin, specification, insurance) {
     };
   });
 
-  // Rank using composite score: specialty x status x availableBeds / timeToTreatment
   const ranked = [...scored].sort(
-    (a, b) =>
-      scoreHospital(b, normalizedSpecification) - scoreHospital(a, normalizedSpecification)
+    (a, b) => scoreHospital(b, normalizedSpecification) - scoreHospital(a, normalizedSpecification)
   );
 
   let candidates = normalizedSpecification
@@ -371,9 +444,7 @@ async function computeRoute(origin, specification, insurance) {
     insurance: normalizedInsurance,
     insuranceMatchFound:
       !normalizedInsurance ||
-      candidates.some((node) =>
-        (node.acceptedInsurance ?? []).includes(normalizedInsurance)
-      ),
+      candidates.some((node) => (node.acceptedInsurance ?? []).includes(normalizedInsurance)),
     model: "score = specialty x status x availableBeds / (ETA + waitMins)",
     closest,
     recommended,
@@ -384,77 +455,7 @@ async function computeRoute(origin, specification, insurance) {
   };
 }
 
-function deriveStatus(utilization) {
-  if (utilization >= 0.95) return "Diversion";
-  if (utilization >= 0.80) return "Saturation";
-  return "Open";
-}
-
-function scoreHospital(node, spec) {
-  const STATUS_MULTIPLIER = { Open: 1.0, Saturation: 0.5, Diversion: 0 };
-  const timeToTreatment = (node.durationMins + node.waitMins) || 1;
-  const specialty = spec
-    ? (node.centerTypes ?? []).includes(spec) ? 3.0 : 0.5
-    : 1.0;
-  const status = STATUS_MULTIPLIER[node.status] ?? 1.0;
-  return (specialty * status * node.availableBeds) / timeToTreatment;
-}
-
-function shouldAutoApprove(hospitalId) {
-  const hospital = cachedHospitals.find((h) => h.id === hospitalId);
-  if (!hospital) return false;
-  const utilization = hospital.beds.inpatient_utilization / 100;
-  const availableBeds = Math.round(hospital.beds.inpatient_total - hospital.beds.inpatient_used);
-  const waitMins = Math.round(10 + hospital.beds.inpatient_utilization * 0.5);
-  return deriveStatus(utilization) === "Open" && availableBeds >= 5 && waitMins <= 60;
-}
-
-function normalizeSpecification(input) {
-  if (!input || typeof input !== "string") return null;
-  const normalized = input.trim().toLowerCase();
-  return ["stemi", "stroke", "trauma"].includes(normalized) ? normalized : null;
-}
-
-function normalizeInsurance(input) {
-  if (!input || typeof input !== "string") return null;
-  const normalized = input.trim();
-  const valid = ["Medicare", "Medicaid", "Blue Cross", "Aetna", "United Healthcare", "Cigna", "Kaiser"];
-  return valid.includes(normalized) ? normalized : null;
-}
-
-async function getTravelMetrics(origin, nodes) {
-  if (!googleMapsApiKey) {
-    return nodes.map((node) => {
-      const distanceMiles = haversineMiles(origin.lat, origin.lng, node.lat, node.lng);
-      const durationMins = Math.round((distanceMiles / 24) * 60);
-      return { distanceMiles: Number(distanceMiles.toFixed(2)), durationMins };
-    });
-  }
-
-  const response = await googleMapsClient.distancematrix({
-    params: {
-      origins: [`${origin.lat},${origin.lng}`],
-      destinations: nodes.map((node) => `${node.lat},${node.lng}`),
-      departure_time: "now",
-      traffic_model: "best_guess",
-      key: googleMapsApiKey,
-    },
-    timeout: 3500,
-  });
-
-  const matrixRow = response.data.rows?.[0]?.elements ?? [];
-  return matrixRow.map((element, index) => {
-    if (element.status !== "OK") {
-      const node = nodes[index];
-      const distanceMiles = haversineMiles(origin.lat, origin.lng, node.lat, node.lng);
-      const durationMins = Math.round((distanceMiles / 24) * 60);
-      return { distanceMiles: Number(distanceMiles.toFixed(2)), durationMins };
-    }
-    const distanceMiles = Number((element.distance.value / 1609.344).toFixed(2));
-    const durationSource = element.duration_in_traffic?.value ?? element.duration?.value ?? 0;
-    return { distanceMiles, durationMins: Math.round(durationSource / 60) };
-  });
-}
+// --- Helper functions ---
 
 function createRequest(dispatch, chainIndex, escalatedFromName) {
   const entry = dispatch.chain[chainIndex];
@@ -503,7 +504,54 @@ function scoreHospital(node, spec) {
     ? (node.centerTypes ?? []).includes(spec) ? 3.0 : 0.5
     : 1.0;
   const status = STATUS_MULTIPLIER[node.status] ?? 1.0;
-  return specialty * status * node.availableBeds / timeToTreatment;
+  return (specialty * status * node.availableBeds) / timeToTreatment;
+}
+
+function normalizeSpecification(input) {
+  if (!input || typeof input !== "string") return null;
+  const normalized = input.trim().toLowerCase();
+  return ["stemi", "stroke", "trauma"].includes(normalized) ? normalized : null;
+}
+
+function normalizeInsurance(input) {
+  if (!input || typeof input !== "string") return null;
+  const normalized = input.trim();
+  const valid = ["Medicare", "Medicaid", "Blue Cross", "Aetna", "United Healthcare", "Cigna", "Kaiser"];
+  return valid.includes(normalized) ? normalized : null;
+}
+
+async function getTravelMetrics(origin, nodes) {
+  if (!googleMapsApiKey) {
+    return nodes.map((node) => {
+      const distanceMiles = haversineMiles(origin.lat, origin.lng, node.lat, node.lng);
+      const durationMins = Math.round((distanceMiles / 24) * 60);
+      return { distanceMiles: Number(distanceMiles.toFixed(2)), durationMins };
+    });
+  }
+
+  const response = await googleMapsClient.distancematrix({
+    params: {
+      origins: [`${origin.lat},${origin.lng}`],
+      destinations: nodes.map((node) => `${node.lat},${node.lng}`),
+      departure_time: "now",
+      traffic_model: "best_guess",
+      key: googleMapsApiKey,
+    },
+    timeout: 3500,
+  });
+
+  const matrixRow = response.data.rows?.[0]?.elements ?? [];
+  return matrixRow.map((element, index) => {
+    if (element.status !== "OK") {
+      const node = nodes[index];
+      const distanceMiles = haversineMiles(origin.lat, origin.lng, node.lat, node.lng);
+      const durationMins = Math.round((distanceMiles / 24) * 60);
+      return { distanceMiles: Number(distanceMiles.toFixed(2)), durationMins };
+    }
+    const distanceMiles = Number((element.distance.value / 1609.344).toFixed(2));
+    const durationSource = element.duration_in_traffic?.value ?? element.duration?.value ?? 0;
+    return { distanceMiles, durationMins: Math.round(durationSource / 60) };
+  });
 }
 
 function haversineMiles(lat1, lon1, lat2, lon2) {

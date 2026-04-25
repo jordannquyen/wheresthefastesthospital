@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Circle,
   Autocomplete,
@@ -32,11 +32,13 @@ function App() {
   const [addressAutocomplete, setAddressAutocomplete] = useState(null);
   const [activeTab, setActiveTab] = useState("emt");
   const [hospitalRequests, setHospitalRequests] = useState([]);
+  const [sentRequests, setSentRequests] = useState({}); // { [hospitalId]: requestId }
   const [selectedHospitalFilter, setSelectedHospitalFilter] = useState("");
   const [mapCenter, setMapCenter] = useState(centerGL);
   const [mapZoom, setMapZoom] = useState(defaultZoom);
   const [dispatch, setDispatch] = useState(null);
   const [adminHospitals, setAdminHospitals] = useState([]);
+  const addressInputRef = useRef(null);
 
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
@@ -49,12 +51,39 @@ function App() {
     return () => clearInterval(pulseInterval);
   }, []);
 
+  // Poll hospital requests while on hospital tab
   useEffect(() => {
     if (activeTab !== "hospital") return;
     fetchHospitalRequests();
     const iv = setInterval(fetchHospitalRequests, 3500);
     return () => clearInterval(iv);
   }, [activeTab, selectedHospitalFilter]);
+
+  // Poll dispatch status while active
+  useEffect(() => {
+    if (!dispatch?.dispatchId || dispatch.status !== "active") return;
+    const iv = setInterval(async () => {
+      const res = await fetch(`/api/dispatch/${dispatch.dispatchId}`);
+      const data = await res.json();
+      if (res.ok) setDispatch(data);
+    }, 3000);
+    return () => clearInterval(iv);
+  }, [dispatch?.dispatchId, dispatch?.status]);
+
+  // Populate admin hospitals from nodes
+  useEffect(() => {
+    if (nodes.length === 0) return;
+    fetch("/api/admin/overrides")
+      .then((r) => r.json())
+      .then((data) => {
+        setAdminHospitals(
+          nodes.map((n) => ({ hospitalId: n.id, hospitalName: n.name, override: data.overrides?.[n.id] ?? null }))
+        );
+      })
+      .catch(() => {
+        setAdminHospitals(nodes.map((n) => ({ hospitalId: n.id, hospitalName: n.name, override: null })));
+      });
+  }, [nodes]);
 
   async function fetchHospitalsByCoords(lat, lng) {
     try {
@@ -83,13 +112,47 @@ function App() {
   }
 
   async function handleRequest(candidate) {
-    const res = await fetch("/api/requests", {
+    const res = await fetch("/api/dispatch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chain: [{
+          hospitalId: candidate.id,
+          hospitalName: candidate.name,
+          etaMins: candidate.durationMins,
+          utilization: candidate.utilization,
+          availableBeds: candidate.availableBeds,
+          waitMins: candidate.waitMins,
+        }],
+        patientSpec: specification || null,
+        insurance: insurance || null,
+      }),
+    });
+    const data = await res.json();
+    if (res.ok) setSentRequests((prev) => ({ ...prev, [candidate.id]: data.requestId }));
+  }
+
+  async function handleDispatch() {
+    if (!route?.top3?.length) return;
+    const chain = route.top3.map((c) => ({
+      hospitalId: c.id,
+      hospitalName: c.name,
+      etaMins: c.durationMins,
+      utilization: c.utilization,
+      availableBeds: c.availableBeds,
+      waitMins: c.waitMins,
+    }));
+    const res = await fetch("/api/dispatch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chain, patientSpec: specification || null, insurance: insurance || null }),
     });
     const data = await res.json();
-    if (res.ok) setSentRequests((prev) => ({ ...prev, [candidate.id]: data.requestId }));
+    if (res.ok) {
+      const pollRes = await fetch(`/api/dispatch/${data.dispatchId}`);
+      const pollData = await pollRes.json();
+      if (pollRes.ok) setDispatch(pollData);
+    }
   }
 
   async function handleRequestAction(requestId, status) {
@@ -99,6 +162,23 @@ function App() {
       body: JSON.stringify({ status }),
     });
     fetchHospitalRequests();
+  }
+
+  async function handleAdminOverride(hospitalId, status) {
+    if (!status) {
+      await fetch(`/api/admin/override/${hospitalId}`, { method: "DELETE" });
+    } else {
+      await fetch("/api/admin/override", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ hospitalId, status }),
+      });
+    }
+    const res = await fetch("/api/admin/overrides");
+    const data = await res.json();
+    setAdminHospitals(
+      nodes.map((n) => ({ hospitalId: n.id, hospitalName: n.name, override: data.overrides?.[n.id] ?? null }))
+    );
   }
 
   async function handleMapClick(event) {
@@ -116,6 +196,7 @@ function App() {
   async function requestRecommendations(inputOrigin) {
     setOrigin(inputOrigin);
     setSentRequests({});
+    setDispatch(null);
     const res = await fetch("/api/route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -135,7 +216,6 @@ function App() {
     }
   }
 
-  // Prefer enriched candidate from route (has distanceMiles, durationMins, waitMins, status)
   const selectedHospital =
     route?.candidates?.find((c) => c.id === selectedHospitalId) ??
     nodes.find((n) => n.id === selectedHospitalId) ??
@@ -144,7 +224,7 @@ function App() {
 
   async function handleLocationSubmit(event) {
     event.preventDefault();
-    const addressValue = addressInputRef?.value?.trim() || locationAddress.trim();
+    const addressValue = addressInputRef.current?.value?.trim() || locationAddress.trim();
     if (!addressValue) { setLocationError("Enter an address to continue."); return; }
     try {
       setLocationError("");
@@ -196,6 +276,8 @@ function App() {
     return <main className="screen bg-grid p-8 text-red-300">Failed to load Google Maps: {loadError.message}</main>;
   }
 
+  const tabs = ["emt", "hospital", ...(isAdminMode ? ["admin"] : [])];
+
   return (
     <main className="screen bg-grid text-slate-100">
       <section className="mx-auto grid h-full w-full max-w-[1500px] grid-rows-[auto_auto_1fr] gap-4 p-4 lg:p-6">
@@ -205,7 +287,7 @@ function App() {
         </header>
 
         <nav className="flex gap-1 rounded-2xl border border-slate-700 bg-slate-950/70 p-1">
-          {["emt", "hospital"].map((tab) => (
+          {tabs.map((tab) => (
             <button
               key={tab}
               type="button"
@@ -214,7 +296,7 @@ function App() {
                 activeTab === tab ? "bg-cyan-500 text-slate-950" : "text-slate-300 hover:bg-slate-800"
               }`}
             >
-              {tab === "emt" ? "EMT View" : "Hospital View"}
+              {tab === "emt" ? "EMT View" : tab === "hospital" ? "Hospital View" : "Admin"}
             </button>
           ))}
         </nav>
@@ -347,7 +429,7 @@ function App() {
                       options={{ fields: ["formatted_address", "geometry", "name"], componentRestrictions: { country: "us" } }}
                     >
                       <input
-                        ref={setAddressInputRef}
+                        ref={addressInputRef}
                         type="text"
                         onChange={(e) => setLocationAddress(e.target.value)}
                         className="w-full rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
@@ -442,7 +524,7 @@ function App() {
                             disabled={!!sentRequests[candidate.id]}
                             className={`mt-2 w-full rounded-lg px-3 py-1.5 text-xs font-semibold transition ${sentRequests[candidate.id] ? "cursor-not-allowed bg-slate-700 text-slate-400" : "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30"}`}
                           >
-                            {sentRequests[candidate.id] ? "Requested ✓" : "Notify Hospital"}
+                            {sentRequests[candidate.id] ? "Notified ✓" : "Notify Hospital"}
                           </button>
                         </div>
                       ))}
@@ -495,6 +577,10 @@ function App() {
             onFilterChange={setSelectedHospitalFilter}
           />
         )}
+
+        {activeTab === "admin" && isAdminMode && (
+          <AdminView hospitals={adminHospitals} onOverride={handleAdminOverride} />
+        )}
       </section>
     </main>
   );
@@ -514,7 +600,7 @@ function AdminView({ hospitals, onOverride }) {
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
         {hospitals.map((h) => (
           <div key={h.hospitalId} className="rounded-[28px] border border-slate-700 bg-slate-900/60 p-4">
-            <p className="font-semibold text-slate-100">{h.hospitalId}</p>
+            <p className="font-semibold text-slate-100">{h.hospitalName ?? h.hospitalId}</p>
             <div className="mt-1 flex items-center gap-2 text-xs">
               {h.override && (
                 <span className={`rounded-full px-2 py-0.5 font-semibold ${statusBadgeColor(h.override)}`}>
@@ -569,6 +655,7 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
               <div key={req.requestId} className="rounded-[28px] border border-slate-700 bg-slate-900/60 p-4">
                 <div className="flex flex-wrap items-center gap-2">
                   {req.patientSpec && <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1 text-xs font-semibold uppercase text-cyan-200">{req.patientSpec}</span>}
+                  {req.escalatedFrom && <span className="rounded-full border border-orange-400/30 bg-orange-400/10 px-2.5 py-1 text-xs font-semibold text-orange-200">Rerouted from {req.escalatedFrom}</span>}
                   {req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Auto-Approved</span>}
                   <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${requestStatusClass(req.status)}`}>{req.status.charAt(0).toUpperCase() + req.status.slice(1)}</span>
                 </div>
@@ -607,6 +694,12 @@ function getHospitalStats(hospital) {
     icuAvailable: Math.round((b.icu_total ?? 0) - (b.icu_used ?? 0)),
     waitMins: hospital.waitMins ?? Math.round(10 + (b.inpatient_utilization ?? 0) * 0.5),
   };
+}
+
+function dispatchPanelClass(status) {
+  if (status === "accepted") return "border-emerald-500/40 bg-emerald-500/10 text-emerald-200";
+  if (status === "exhausted") return "border-red-500/40 bg-red-500/10 text-red-200";
+  return "border-cyan-500/40 bg-cyan-500/10 text-cyan-200";
 }
 
 function requestStatusClass(status) {
