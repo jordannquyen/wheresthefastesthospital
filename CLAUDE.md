@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Vital-Route** (WTF — Where's The Fastest Hospital) is a healthcare network routing demo for the LA area. It treats patients as packets and hospitals as nodes, ranking the top 3 options by a scoring formula. Live utilization data comes from the HHS Socrata API; traffic-aware travel times come from Google Distance Matrix.
+**Vital-Route** (WTF — Where's The Fastest Hospital) is a healthcare network routing demo for the LA area. EMTs speak a patient intake, the app extracts structured data from the transcript, and routes to the top 3 hospitals scored by capacity, ETA, and specialty match. Live utilization comes from the HHS Socrata API; traffic times from Google Distance Matrix; voice I/O from ElevenLabs.
 
 ## Commands
 
@@ -19,106 +19,114 @@ npm run preview      # preview production build
 npm start            # production Express server only
 ```
 
-**Required before running:** create a `.env` file with `GOOGLE_MAPS_API_KEY=<key>`. Without it, the app runs in fallback mode (haversine estimates; geocoding and Places Autocomplete disabled).
+If Vite crashes with a missing `@rollup/rollup-win32-x64-msvc` error, delete `node_modules` and `package-lock.json` and re-run `npm install`.
+
+## Environment Variables (`.env`)
+
+| Variable | Purpose |
+|---|---|
+| `GOOGLE_MAPS_API_KEY` | Geocoding, Distance Matrix, Places Autocomplete |
+| `ELEVENLABS_API_KEY` | Speech-to-text (`/api/stt`) and text-to-speech (`/api/tts`) |
+| `ELEVENLABS_VOICE_ID` | Optional — defaults to `JBFqnCBsd6RMkjVDRZzb` |
+| `MONGODB_URI` | MongoDB Atlas connection string for patient persistence |
+| `MONGODB_DB_NAME` | Database name (e.g. `vital_route`) |
+| `PORT` | Backend port — defaults to `8787` |
+
+Without `GOOGLE_MAPS_API_KEY`: haversine fallback, address input disabled, map click still works. Without `ELEVENLABS_API_KEY`: voice button disabled, UI shows "voice offline". Without MongoDB: patient persistence disabled, all other features work.
 
 ## Architecture
 
-Single-page React frontend talking to an Express backend via a Vite dev proxy (`/api/*` → `localhost:8787`). All state is in-memory on the server — no database.
+Single-page React frontend (`src/App.jsx`) talking to an Express backend (`server/index.js`) via a Vite dev proxy (`/api/*` → `localhost:8787`). All dispatch/request state is in-memory on the server; patient records persist to MongoDB Atlas when configured.
 
 ### Backend (`server/index.js`)
 
 **In-memory stores:**
 - `requests` — individual hospital notification records
-- `dispatches` — EMT dispatch sessions (ordered chain of hospitals)
-- `hospitalOverrides` — admin-injected status overrides `{ [hospitalId]: "Open"|"Saturation"|"Diversion" }`
+- `dispatches` — EMT dispatch sessions with ordered hospital chain
+- `hospitalOverrides` — admin status overrides `{ [hospitalId]: "Open"|"Saturation"|"Diversion" }`
 
-**Key pipeline functions:**
-- `fetchHospitalsByDistance(lat, lng, radiusMiles)` — queries HHS Socrata API, deduplicates by latest week, filters by haversine distance
-- `fetchAndCacheHospitals(city, state, limit)` — city-based fetch with 1-hour cache
-- `getTravelMetrics(origin, nodes)` — Google Distance Matrix with haversine fallback
-- `computeRoute(origin, specification, insurance)` — full pipeline: fetch → travel metrics → score → filter → return top 3
+**Key pipeline:**
+- `fetchHospitalsByDistance(lat, lng, radiusMiles)` — Socrata API, deduplicates by latest week, 60-second cache keyed by lat/lng bucket
+- `fetchAndCacheHospitals(city, state, limit)` — city-based fetch, 1-hour cache
+- `getTravelMetrics(origin, nodes)` — Google Distance Matrix, haversine fallback if no key
+- `computeRoute(origin, specification, insurance)` — fetch → travel metrics → score → filter → top 3
 - `scoreHospital(node, spec)` — `specialty × status × availableBeds / (ETA + waitMins)`
-- `createRequest(dispatch, chainIndex, escalatedFromName)` — creates a request record, auto-approves if `shouldAutoApprove`
+- `createRequest(dispatch, chainIndex, escalatedFromName)` — creates request, auto-approves if conditions met
 - `shouldAutoApprove(hospitalId, nodeMetrics)` — `status === "Open" && availableBeds >= 5 && waitMins <= 60`; respects `hospitalOverrides`
-- `getEffectiveStatus(hospitalId, utilization)` — returns override if set, else `deriveStatus(utilization)`
+- `getEffectiveStatus(hospitalId, utilization)` — returns override if set, else `deriveStatus`
 - `deriveStatus(utilization)` — Open < 0.80, Saturation 0.80–0.95, Diversion ≥ 0.95
 
-**Scoring multipliers:**
-- Specialty: 3.0 (match), 0.5 (spec requested but no match), 1.0 (no spec)
-- Status: Open=1.0, Saturation=0.5, Diversion=0
+**Scoring multipliers:** specialty match=3.0, no match=0.5, no spec=1.0 | Open=1.0, Saturation=0.5, Diversion=0
 
-**API endpoints (all prefixed `/api/`):**
+**All API endpoints (`/api/`):**
 
 | Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/health` | Provider status (`google` or `fallback`) |
-| POST | `/geocode` | Address → `{ lat, lng }` |
+|---|---|---|
+| GET | `/health` | Provider status: `{ google, voice, mongo }` flags |
+| POST | `/patients` | Create patient record in MongoDB |
+| GET | `/patients` | List patients (filter by `?status=`, `?specification=`) |
+| GET | `/patients/:patientId` | Get single patient |
+| PATCH | `/patients/:patientId` | Update patient fields |
+| GET | `/nodes` | Hospitals by `?city=` |
 | POST | `/hospitals-by-coords` | Hospitals within 50 mi of `{ lat, lng }` |
-| POST | `/route` | Full recommendation → top 3 |
-| GET | `/telemetry` | Utilization snapshot by city |
+| GET | `/telemetry` | Utilization snapshot by `?city=` |
 | GET | `/hospitals` | Raw Socrata data by city/state |
-| GET | `/nodes` | Alias for `/hospitals` |
-| POST | `/dispatch` | Create dispatch session with ordered hospital chain |
-| GET | `/dispatch/:dispatchId` | Poll dispatch status + chain with per-entry request status |
+| POST | `/geocode` | Address → `{ lat, lng }` |
+| POST | `/route` | Full recommendation → top 3 |
+| POST | `/stt` | Multipart audio → `{ transcript }` via ElevenLabs |
+| POST | `/tts` | `{ text }` → audio stream via ElevenLabs |
+| POST | `/dispatch` | Create dispatch session with hospital chain |
+| GET | `/dispatch/:dispatchId` | Poll dispatch + chain status |
 | GET | `/requests` | List requests, filter by `?hospitalId=` |
-| PATCH | `/requests/:requestId` | Accept or divert; divert auto-escalates to next in chain |
-| POST | `/admin/override` | Set hospital status override |
+| PATCH | `/requests/:requestId` | Accept or divert; divert auto-escalates chain |
+| POST | `/admin/override` | Force hospital status |
 | DELETE | `/admin/override/:hospitalId` | Remove override |
 | GET | `/admin/overrides` | List active overrides |
 
-**Dispatch / escalation flow:**
-1. EMT calls `POST /api/dispatch` with `{ chain: [{hospitalId, hospitalName, etaMins, utilization, availableBeds, waitMins}, ...], patientSpec, insurance }`
-2. Server creates a `dispatch` record and fires `createRequest` for chain index 0
-3. Auto-approve check runs immediately; if approved, request status = `"accepted"`, dispatch status = `"accepted"`
-4. If pending: hospital staff call `PATCH /api/requests/:id` with `{ status: "diverted" }`
-5. On divert: server advances `dispatch.currentIndex`, creates a new request for the next hospital
-6. If chain is exhausted: `dispatch.status = "exhausted"`
+**Dispatch / escalation:** EMT calls `POST /api/dispatch` with `{ chain: [{hospitalId, hospitalName, etaMins, utilization, availableBeds, waitMins}], patientSpec, insurance }`. Server creates requests for chain[0], auto-approves if healthy. On divert, escalates to chain[1], and so on. `dispatch.status` → `"active"` → `"accepted"` or `"exhausted"`.
 
 ### Frontend (`src/App.jsx`)
 
-Single large component. Key state:
-- `nodes` — hospital list from `/api/hospitals-by-coords`
-- `route` — result from `/api/route` (includes `top3`, `closest`, `recommended`)
-- `dispatch` — polled dispatch session from `/api/dispatch/:id`
-- `adminHospitals` — hospital list for admin override UI
-- `activeTab` — `"emt"` | `"hospital"` | `"admin"` (admin only visible with `?admin=true`)
+Single large component. Key state: `nodes`, `route`, `dispatch`, `adminHospitals`, `activeTab` (`"emt"|"hospital"|"admin"`).
 
 **Key flows:**
-1. Address input / map click / Places Autocomplete → geocode → `fetchHospitalsByCoords` → `requestRecommendations`
-2. "Dispatch Patient" button → `handleDispatch()` → `POST /api/dispatch` → polls `GET /api/dispatch/:id` every 3s while `dispatch.status === "active"`
-3. Telemetry polled every 10s via `fetchTelemetry()` (updates map circle colors)
-4. Hospital tab polls `GET /api/requests` every 3.5s while tab is active
+1. **On load** — browser geolocation → `fetchHospitalsByCoords` → `requestRecommendations`; map panned imperatively via `mapRef.current.panTo()`
+2. **Voice intake** — `useVoice` hook records audio → `POST /api/stt` → transcript → `extractPatient()` → fills form fields
+3. **Address / autocomplete** — Places Autocomplete geometry used directly on form submit; backend geocoder only as fallback
+4. **Map click** — `handleMapClick` → same fetch/route flow
+5. **Dispatch** — `handleDispatch()` → `POST /api/dispatch` → polls `GET /api/dispatch/:id` every 3s while `status === "active"`
+6. **Hospital tab** — polls `GET /api/requests` every 3.5s
+7. **Telemetry** — polls `GET /api/telemetry` every 10s
 
-**Admin mode:** append `?admin=true` to URL to reveal the Admin tab. Lets you toggle any hospital's status to force Saturation or Diversion, enabling divert testing in the demo.
+**Admin mode:** append `?admin=true` to URL to reveal the Admin tab for demo override testing.
 
-**Map rendering:** `@react-google-maps/api`. Hospitals are colored `Circle` overlays (green < 50%, yellow 50–89%, red ≥ 90%, pulsing above 90%) with `Polyline` routes (dashed grey = closest baseline, solid cyan = recommended, lighter cyan = alternatives).
+**Map:** `@react-google-maps/api` with `Circle` overlays (green < 50%, yellow 50–89%, red ≥ 90% utilization) and `Polyline` routes. Map instance stored in `mapRef` via `onLoad` for imperative control.
+
+### Voice pipeline (`src/hooks/useVoice.js`, `src/lib/extractPatient.js`)
+
+`useVoice` — manages `MediaRecorder`, sends audio blob to `/api/stt`, receives transcript. Also wraps `/api/tts` for spoken replies. Backend uses ElevenLabs for both directions.
+
+`extractPatient(transcript)` — pure client-side regex extraction. Returns `{ name, age, sex, specification, insurance, location: { phrase }, vitals: { bp, hr, spo2 }, transcript }`. `location.phrase` is free text that must be geocoded before posting to `/api/route`.
 
 ### Data model
 
 Hospital node from `/api/route`:
 ```js
-{
-  id, name, lat, lng, address, city, state, zip,
+{ id, name, lat, lng, address, city, state, zip,
   distance, durationMins, distanceMiles,
   beds: { inpatient_total, inpatient_used, inpatient_utilization, icu_total, icu_used, icu_utilization },
-  utilization, waitMins, availableBeds, status
-}
+  utilization, waitMins, availableBeds, status }
 ```
 
-Dispatch chain entry sent from frontend:
+Patient record (MongoDB):
 ```js
-{ hospitalId, hospitalName, etaMins, utilization, availableBeds, waitMins }
+{ patientId, name, age, specification, location: { lat, lng }, status, createdAt }
 ```
 
-## Environment & Configuration
+## Configuration Files
 
 | File | Purpose |
-|------|---------|
-| `.env` | `GOOGLE_MAPS_API_KEY`, optional `PORT` (default 8787) |
+|---|---|
 | `vite.config.js` | React plugin, `/api` proxy to `:8787`, exposes `VITE_` and `GOOGLE_` env vars |
 | `tailwind.config.js` | Fonts: Space Grotesk (display), IBM Plex Mono (mono) |
 | `eslint.config.js` | Lints `src/` only; `server/` and `dist/` excluded |
-
-## Fallback Mode
-
-When `GOOGLE_MAPS_API_KEY` is missing: haversine distances only, `provider = "fallback"`, address input and Places Autocomplete disabled, map click still works.
