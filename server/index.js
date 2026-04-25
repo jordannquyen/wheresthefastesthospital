@@ -1014,6 +1014,59 @@ app.patch("/api/patients/:patientId/accept", authRequired, requireRole("hospital
   return res.json({ patient: serializePatient(result) });
 }));
 
+app.patch("/api/patients/:patientId/divert", authRequired, requireRole("hospital"), ah(async (req, res) => {
+  const { patientId } = req.params;
+
+  // Find the matching pending in-memory request for this patient
+  const record = Object.values(requests).find(
+    (r) => r.patientId === patientId && r.status === "pending"
+  );
+  if (!record) return res.status(404).json({ error: "no pending request found for this patient" });
+
+  const isAdminScope = String(req.user.hospitalId) === "__all__";
+  if (!isAdminScope && String(record.hospitalId) !== String(req.user.hospitalId)) {
+    return res.status(403).json({ error: "cannot divert another hospital's request" });
+  }
+
+  // Run the same divert logic as PATCH /api/requests/:requestId
+  record.status = "diverted";
+  if (escalationTimers[record.requestId]) {
+    clearTimeout(escalationTimers[record.requestId]);
+    delete escalationTimers[record.requestId];
+  }
+
+  const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
+  if (dispatch) {
+    const nextIndex = dispatch.currentIndex + 1;
+    if (nextIndex < dispatch.chain.length) {
+      dispatch.currentIndex = nextIndex;
+      const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
+      dispatch.activeRequestId = nextRequestId;
+      if (requests[nextRequestId].status === "accepted") dispatch.status = "accepted";
+
+      const nextEntry = dispatch.chain[nextIndex];
+      const collection = getPatientsCollectionOrNull();
+      if (patientId && collection) {
+        await collection.findOneAndUpdate(
+          { patientId },
+          { $set: {
+            recommendedHospitalId: nextEntry.hospitalId,
+            recommendedHospitalName: nextEntry.hospitalName,
+            assignedHospitalId: null,
+            assignedHospitalName: null,
+            status: "routed",
+            updatedAt: new Date(),
+          }},
+        );
+      }
+    } else {
+      dispatch.status = "exhausted";
+    }
+  }
+
+  return res.json({ ok: true, dispatch: dispatch ?? null });
+}));
+
 app.patch("/api/patients/:patientId/deliver", authRequired, ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) return res.status(503).json({ error: "MongoDB not configured" });
@@ -1412,6 +1465,23 @@ app.patch("/api/requests/:requestId", authRequired, ah(async (req, res) => {
         const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
         dispatch.activeRequestId = nextRequestId;
         if (requests[nextRequestId].status === "accepted") dispatch.status = "accepted";
+
+        // Update MongoDB so hospital views reflect the new routing
+        const nextEntry = dispatch.chain[nextIndex];
+        const collection = getPatientsCollectionOrNull();
+        if (dispatch.patientId && collection) {
+          await collection.findOneAndUpdate(
+            { patientId: dispatch.patientId },
+            { $set: {
+              recommendedHospitalId: nextEntry.hospitalId,
+              recommendedHospitalName: nextEntry.hospitalName,
+              assignedHospitalId: null,
+              assignedHospitalName: null,
+              status: "routed",
+              updatedAt: new Date(),
+            }},
+          );
+        }
       } else {
         dispatch.status = "exhausted";
       }
@@ -1533,7 +1603,7 @@ async function computeRoute(origin, condition, insurance) {
 
 // --- Helper functions ---
 
-function escalateRequest(requestId) {
+async function escalateRequest(requestId) {
   const record = requests[requestId];
   if (!record || record.status !== "pending") return;
   delete escalationTimers[requestId];
@@ -1549,6 +1619,23 @@ function escalateRequest(requestId) {
       const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
       dispatch.activeRequestId = nextRequestId;
       if (requests[nextRequestId].status === "accepted") dispatch.status = "accepted";
+
+      // Update MongoDB so hospital views reflect the new routing
+      const nextEntry = dispatch.chain[nextIndex];
+      const collection = getPatientsCollectionOrNull();
+      if (dispatch.patientId && collection) {
+        await collection.findOneAndUpdate(
+          { patientId: dispatch.patientId },
+          { $set: {
+            recommendedHospitalId: nextEntry.hospitalId,
+            recommendedHospitalName: nextEntry.hospitalName,
+            assignedHospitalId: null,
+            assignedHospitalName: null,
+            status: "routed",
+            updatedAt: new Date(),
+          }},
+        );
+      }
     } else {
       dispatch.status = "exhausted";
     }

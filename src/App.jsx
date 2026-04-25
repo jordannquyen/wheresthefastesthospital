@@ -496,6 +496,8 @@ function AuthenticatedApp({ user }) {
             etaMinutes: request.etaMins,
           }),
         });
+      } else if (status === "diverted") {
+        await apiFetch(`/api/patients/${request.patientId}/divert`, { method: "PATCH" });
       }
       fetchHospitalRequests();
       return;
@@ -1391,9 +1393,7 @@ function HospitalView({ hospitalName, requests, onAccept, onDivert, onDelete }) 
                 {req.status === "pending" && (
                   <div className="mt-4 flex gap-2">
                     <button type="button" onClick={() => onAccept(req)} className="flex-1 rounded-md bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30">Accept</button>
-                    {req.source !== "patient" && (
-                      <button type="button" onClick={() => onDivert(req)} className="flex-1 rounded-md bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/30">Divert</button>
-                    )}
+                    <button type="button" onClick={() => onDivert(req)} className="flex-1 rounded-md bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/30">Divert</button>
                   </div>
                 )}
               </div>
