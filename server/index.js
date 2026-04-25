@@ -66,60 +66,118 @@ async function initializeMongo() {
   await patientsCollection.createIndexes([
     { key: { patientId: 1 }, unique: true },
     { key: { status: 1 } },
-    { key: { specification: 1 } },
+    { key: { condition: 1 } },
+    { key: { assignedHospitalId: 1, status: 1 } },
+    { key: { recommendedHospitalId: 1, status: 1 } },
     { key: { createdAt: -1 } },
+    { key: { updatedAt: -1 } },
   ]);
 
   console.log(`Connected to MongoDB Atlas database: ${mongoDbName}`);
 }
 
-function normalizePatientInput(body, { allowPartial = false } = {}) {
+const PATIENT_STRING_FIELDS = new Set([
+  "patientId",
+  "name",
+  "sex",
+  "chiefComplaint",
+  "condition",
+  "severity",
+  "status",
+  "bloodPressure",
+  "transcript",
+  "summary",
+  "address",
+  "ambulanceUnit",
+  "emtName",
+  "recommendedHospitalId",
+  "recommendedHospitalName",
+  "assignedHospitalId",
+  "assignedHospitalName",
+  "routingReason",
+  "insuranceProvider",
+  "insuranceMemberId",
+]);
+
+const PATIENT_NUMBER_FIELDS = new Set([
+  "age",
+  "heartRate",
+  "oxygenSaturation",
+  "respiratoryRate",
+  "confidence",
+  "latitude",
+  "longitude",
+  "etaMinutes",
+]);
+
+const PATIENT_DATE_FIELDS = new Set(["acceptedAt", "createdAt", "updatedAt"]);
+const PATIENT_SEVERITIES = new Set(["critical", "high", "moderate", "low"]);
+const PATIENT_STATUSES = new Set(["active", "routed", "accepted", "arrived", "completed", "cancelled"]);
+const INCOMING_PATIENT_STATUSES = ["active", "routed", "accepted"];
+const ROUTE_TERMINAL_STATUSES = new Set(["accepted", "arrived", "completed"]);
+
+function hasValue(value) {
+  return value !== null && value !== undefined && !(typeof value === "string" && value.trim() === "");
+}
+
+function normalizeSeverity(value) {
+  if (!hasValue(value)) return null;
+  const normalized = String(value).trim().toLowerCase();
+  return PATIENT_SEVERITIES.has(normalized) ? normalized : null;
+}
+
+function normalizeStatus(value) {
+  if (!hasValue(value)) return null;
+  const normalized = String(value).trim().toLowerCase();
+  return PATIENT_STATUSES.has(normalized) ? normalized : null;
+}
+
+function normalizePatientInput(body, { requireClinicalSignal = false } = {}) {
   const next = {};
 
-  if (body.name !== undefined || !allowPartial) {
-    if (typeof body.name !== "string" || !body.name.trim()) {
-      return { error: "name is required and must be a non-empty string" };
+  for (const field of PATIENT_STRING_FIELDS) {
+    if (!hasValue(body[field])) continue;
+    const value = String(body[field]).trim();
+    if (field === "severity") {
+      const severity = normalizeSeverity(value);
+      if (!severity) return { error: "severity must be one of critical, high, moderate, or low" };
+      next.severity = severity;
+    } else if (field === "status") {
+      const status = normalizeStatus(value);
+      if (!status) return { error: "status must be one of active, routed, accepted, arrived, completed, or cancelled" };
+      next.status = status;
+    } else if (field === "sex" || field === "condition") {
+      next[field] = value.toLowerCase();
+    } else {
+      next[field] = value;
     }
-    next.name = body.name.trim();
   }
 
-  if (body.age !== undefined || !allowPartial) {
-    if (typeof body.age !== "number" || !Number.isFinite(body.age) || body.age < 0) {
-      return { error: "age is required and must be a non-negative number" };
-    }
-    next.age = Math.floor(body.age);
+  for (const field of PATIENT_NUMBER_FIELDS) {
+    if (!hasValue(body[field])) continue;
+    const value = Number(body[field]);
+    if (!Number.isFinite(value)) return { error: `${field} must be a number` };
+    next[field] = field === "age" ? Math.floor(value) : value;
   }
 
-  if (body.specification !== undefined || !allowPartial) {
-    if (typeof body.specification !== "string" || !body.specification.trim()) {
-      return { error: "specification is required and must be a non-empty string" };
-    }
-    next.specification = body.specification.trim().toLowerCase();
+  for (const field of PATIENT_DATE_FIELDS) {
+    if (!hasValue(body[field])) continue;
+    const date = body[field] instanceof Date ? body[field] : new Date(body[field]);
+    if (Number.isNaN(date.getTime())) return { error: `${field} must be a valid date` };
+    next[field] = date;
   }
 
-  if (body.location !== undefined || !allowPartial) {
-    if (
-      !body.location
-      || typeof body.location !== "object"
-      || typeof body.location.lat !== "number"
-      || typeof body.location.lng !== "number"
-    ) {
-      return { error: "location is required and must contain numeric lat and lng" };
-    }
-    next.location = {
-      lat: body.location.lat,
-      lng: body.location.lng,
-    };
-  }
-
-  if (body.status !== undefined || !allowPartial) {
-    if (typeof body.status !== "string" || !body.status.trim()) {
-      return { error: "status is required and must be a non-empty string" };
-    }
-    next.status = body.status.trim();
+  if (requireClinicalSignal && !["transcript", "summary", "chiefComplaint", "condition"].some((field) => hasValue(next[field]))) {
+    return { error: "At least one of transcript, summary, chiefComplaint, or condition is required" };
   }
 
   return { value: next };
+}
+
+function serializePatient(patient) {
+  if (!patient) return null;
+  const { _id, ...safePatient } = patient;
+  return safePatient;
 }
 
 const ACRONYMS = new Set([
@@ -358,30 +416,34 @@ app.post("/api/extract-patient", async (req, res) => {
     return res.status(400).json({ error: "transcript is required" });
   }
 
-  const prompt = `Extract structured patient information from this EMT radio transcript. Return ONLY a valid JSON object, no explanation.
+  const prompt = `Extract simple patient information from this EMT radio transcript. Return ONLY a valid JSON object, no explanation.
 
 Schema (use null for any field not mentioned):
 {
   "name": string | null,
   "age": number | null,
   "sex": "male" | "female" | null,
-  "specification": "stemi" | "stroke" | "trauma" | null,
-  "insurance": "Government" | "Kaiser" | null,
   "chiefComplaint": string | null,
-  "mechanism": string | null,
-  "mentalStatus": string | null,
-  "interventions": string[] | null,
-  "vitals": { "bp": string | null, "hr": number | null, "spo2": number | null, "rr": number | null },
-  "location": { "phrase": string } | null
+  "condition": "cardiac" | "stroke" | "trauma" | string | null,
+  "severity": "critical" | "high" | "moderate" | "low" | null,
+  "insuranceProvider": string | null,
+  "bloodPressure": string | null,
+  "heartRate": number | null,
+  "oxygenSaturation": number | null,
+  "respiratoryRate": number | null,
+  "address": string | null,
+  "summary": string | null,
+  "confidence": number | null
 }
 
 Field rules:
-- specification: "stemi" for cardiac/chest emergencies, "stroke" for neurological stroke, "trauma" for physical injury — null for anything else
-- insurance: "Government" for Medicare/Medicaid/government plans, "Kaiser" for Kaiser Permanente — null if not mentioned
-- vitals.bp: "systolic/diastolic" string e.g. "120/80"
-- location.phrase: geocodable address or landmark where the patient is
+- condition: simple broad category such as "cardiac", "stroke", "trauma", "respiratory", or "unknown"
+- severity: use "critical" for unstable vitals/life threat, "high" for serious, "moderate" for concerning but stable, "low" for minor
+- bloodPressure: "systolic/diastolic" string e.g. "120/80"
+- address: geocodable address or landmark where the patient is
 - chiefComplaint: primary presenting problem in plain language (NOT insurance, NOT demographics)
-- interventions: treatments already given, e.g. ["O2", "IV access", "aspirin"]
+- summary: one concise clinical summary sentence
+- confidence: number from 0 to 1 for extraction confidence
 
 Transcript: ${JSON.stringify(transcript)}`;
 
@@ -397,7 +459,6 @@ Transcript: ${JSON.stringify(transcript)}`;
     if (!jsonMatch) throw new Error("No JSON in Claude response");
     const extracted = JSON.parse(jsonMatch[0]);
 
-    if (!extracted.vitals) extracted.vitals = { bp: null, hr: null, spo2: null, rr: null };
     extracted.transcript = transcript.trim();
 
     return res.json(extracted);
@@ -409,26 +470,29 @@ Transcript: ${JSON.stringify(transcript)}`;
 
 // --- Patient endpoints ---
 
-app.post("/api/patients", ah(async (req, res) => {
+app.post("/api/patients/intake", ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
   }
 
-  const normalized = normalizePatientInput(req.body ?? {}, { allowPartial: false });
+  const normalized = normalizePatientInput(req.body ?? {}, { requireClinicalSignal: true });
   if (normalized.error) return res.status(400).json({ error: normalized.error });
 
-  const now = new Date().toISOString();
+  const now = new Date();
   const patient = {
     patientId: randomUUID(),
+    name: "Unknown",
+    status: "active",
     ...normalized.value,
     createdAt: now,
     updatedAt: now,
   };
+  if (!patient.name) patient.name = "Unknown";
+  if (!patient.status) patient.status = "active";
 
   await collection.insertOne(patient);
-  const { _id, ...safePatient } = patient;
-  return res.status(201).json({ patient: safePatient });
+  return res.status(201).json({ patient: serializePatient(patient) });
 }));
 
 app.get("/api/patients", ah(async (req, res) => {
@@ -437,12 +501,10 @@ app.get("/api/patients", ah(async (req, res) => {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
   }
 
-  const { status, specification } = req.query;
+  const { status, condition } = req.query;
   const filter = {};
   if (typeof status === "string" && status.trim()) filter.status = status.trim();
-  if (typeof specification === "string" && specification.trim()) {
-    filter.specification = specification.trim().toLowerCase();
-  }
+  if (typeof condition === "string" && condition.trim()) filter.condition = condition.trim().toLowerCase();
 
   const patients = await collection
     .find(filter, { projection: { _id: 0 } })
@@ -467,19 +529,19 @@ app.get("/api/patients/:patientId", ah(async (req, res) => {
   return res.json({ patient });
 }));
 
-app.patch("/api/patients/:patientId", ah(async (req, res) => {
+app.patch("/api/patients/:patientId/voice-update", ah(async (req, res) => {
   const collection = getPatientsCollectionOrNull();
   if (!collection) {
     return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
   }
 
-  const normalized = normalizePatientInput(req.body ?? {}, { allowPartial: true });
+  const normalized = normalizePatientInput(req.body ?? {});
   if (normalized.error) return res.status(400).json({ error: normalized.error });
   if (Object.keys(normalized.value).length === 0) {
     return res.status(400).json({ error: "No updatable patient fields were provided" });
   }
 
-  const updates = { ...normalized.value, updatedAt: new Date().toISOString() };
+  const updates = { ...normalized.value, updatedAt: new Date() };
   const result = await collection.findOneAndUpdate(
     { patientId: req.params.patientId },
     { $set: updates },
@@ -487,7 +549,121 @@ app.patch("/api/patients/:patientId", ah(async (req, res) => {
   );
 
   if (!result) return res.status(404).json({ error: "patient not found" });
-  return res.json({ patient: result });
+  return res.json({ patient: serializePatient(result) });
+}));
+
+app.patch("/api/patients/:patientId/route", ah(async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) {
+    return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
+  }
+
+  const normalized = normalizePatientInput(req.body ?? {});
+  if (normalized.error) return res.status(400).json({ error: normalized.error });
+
+  const allowed = ["recommendedHospitalId", "recommendedHospitalName", "etaMinutes", "routingReason"];
+  const updates = Object.fromEntries(
+    allowed.filter((field) => hasValue(normalized.value[field])).map((field) => [field, normalized.value[field]])
+  );
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ error: "No route fields were provided" });
+  }
+  updates.updatedAt = new Date();
+
+  const existing = await collection.findOne({ patientId: req.params.patientId }, { projection: { _id: 0 } });
+  if (!existing) return res.status(404).json({ error: "patient not found" });
+  if (!ROUTE_TERMINAL_STATUSES.has(existing.status)) updates.status = "routed";
+
+  const result = await collection.findOneAndUpdate(
+    { patientId: req.params.patientId },
+    { $set: updates },
+    { returnDocument: "after", projection: { _id: 0 } }
+  );
+
+  return res.json({ patient: serializePatient(result) });
+}));
+
+app.patch("/api/patients/:patientId/accept", ah(async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) {
+    return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
+  }
+
+  const { hospitalId, hospitalName, etaMinutes } = req.body ?? {};
+  if (!hasValue(hospitalId) || !hasValue(hospitalName)) {
+    return res.status(400).json({ error: "hospitalId and hospitalName are required" });
+  }
+
+  const updates = {
+    assignedHospitalId: String(hospitalId).trim(),
+    assignedHospitalName: String(hospitalName).trim(),
+    acceptedAt: new Date(),
+    status: "accepted",
+    updatedAt: new Date(),
+  };
+  if (hasValue(etaMinutes)) {
+    const eta = Number(etaMinutes);
+    if (!Number.isFinite(eta)) return res.status(400).json({ error: "etaMinutes must be a number" });
+    updates.etaMinutes = eta;
+  }
+
+  const result = await collection.findOneAndUpdate(
+    { patientId: req.params.patientId },
+    { $set: updates },
+    { returnDocument: "after", projection: { _id: 0 } }
+  );
+
+  if (!result) return res.status(404).json({ error: "patient not found" });
+  return res.json({ patient: serializePatient(result) });
+}));
+
+app.patch("/api/patients/:patientId", ah(async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) {
+    return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
+  }
+
+  const normalized = normalizePatientInput(req.body ?? {});
+  if (normalized.error) return res.status(400).json({ error: normalized.error });
+  if (Object.keys(normalized.value).length === 0) {
+    return res.status(400).json({ error: "No updatable patient fields were provided" });
+  }
+
+  const result = await collection.findOneAndUpdate(
+    { patientId: req.params.patientId },
+    { $set: { ...normalized.value, updatedAt: new Date() } },
+    { returnDocument: "after", projection: { _id: 0 } }
+  );
+
+  if (!result) return res.status(404).json({ error: "patient not found" });
+  return res.json({ patient: serializePatient(result) });
+}));
+
+app.get("/api/hospitals/:hospitalId/incoming-patients", ah(async (req, res) => {
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) {
+    return res.status(503).json({ error: "MongoDB is not configured. Set MONGODB_URI and MONGODB_DB_NAME." });
+  }
+
+  const hospitalId = req.params.hospitalId;
+  const severityOrder = { critical: 0, high: 1, moderate: 2, low: 3 };
+  const patients = await collection
+    .find({
+      status: { $in: INCOMING_PATIENT_STATUSES },
+      $or: [{ assignedHospitalId: hospitalId }, { recommendedHospitalId: hospitalId }],
+    }, { projection: { _id: 0 } })
+    .toArray();
+
+  patients.sort((a, b) => {
+    const sev = (severityOrder[a.severity] ?? 99) - (severityOrder[b.severity] ?? 99);
+    if (sev !== 0) return sev;
+    const etaA = Number.isFinite(a.etaMinutes) ? a.etaMinutes : Infinity;
+    const etaB = Number.isFinite(b.etaMinutes) ? b.etaMinutes : Infinity;
+    if (etaA !== etaB) return etaA - etaB;
+    return new Date(b.updatedAt ?? 0) - new Date(a.updatedAt ?? 0);
+  });
+
+  return res.json({ patients, count: patients.length });
 }));
 
 app.get("/api/nodes", ah(async (req, res) => {
@@ -662,8 +838,8 @@ app.post("/api/tts", async (req, res) => {
 
 // --- Dispatch endpoints ---
 
-app.post("/api/dispatch", (req, res) => {
-  const { chain, insurance, patientSummary } = req.body ?? {};
+app.post("/api/dispatch", ah(async (req, res) => {
+  const { chain, insurance, patientId, patientSummary } = req.body ?? {};
   if (!Array.isArray(chain) || chain.length === 0) {
     return res.status(400).json({ error: "chain must be a non-empty array" });
   }
@@ -674,6 +850,7 @@ app.post("/api/dispatch", (req, res) => {
     chain,
     currentIndex: 0,
     insurance: insurance ?? null,
+    patientId: patientId ?? null,
     patientSummary: patientSummary ?? null,
     activeRequestId: null,
     status: "active",
@@ -683,10 +860,27 @@ app.post("/api/dispatch", (req, res) => {
 
   const requestId = createRequest(dispatch, 0, null);
   dispatch.activeRequestId = requestId;
-  if (requests[requestId].status === "accepted") dispatch.status = "accepted";
+  if (requests[requestId].status === "accepted") {
+    dispatch.status = "accepted";
+    if (patientId && patientsCollection) {
+      await patientsCollection.findOneAndUpdate(
+        { patientId },
+        {
+          $set: {
+            assignedHospitalId: requests[requestId].hospitalId,
+            assignedHospitalName: requests[requestId].hospitalName,
+            acceptedAt: new Date(),
+            etaMinutes: requests[requestId].etaMins,
+            status: "accepted",
+            updatedAt: new Date(),
+          },
+        }
+      );
+    }
+  }
 
   return res.json({ dispatchId, requestId, status: requests[requestId].status, autoApproved: requests[requestId].autoApproved });
-});
+}));
 
 app.get("/api/dispatch/:dispatchId", (req, res) => {
   const dispatch = dispatches[req.params.dispatchId];
@@ -708,6 +902,7 @@ app.get("/api/dispatch/:dispatchId", (req, res) => {
     activeRequest,
     chain: chainWithStatus,
     insurance: dispatch.insurance,
+    patientId: dispatch.patientId,
   });
 });
 
@@ -721,7 +916,7 @@ app.get("/api/requests", (req, res) => {
   res.json({ requests: result });
 });
 
-app.patch("/api/requests/:requestId", (req, res) => {
+app.patch("/api/requests/:requestId", ah(async (req, res) => {
   const { requestId } = req.params;
   const { status } = req.body ?? {};
   const record = requests[requestId];
@@ -743,6 +938,21 @@ app.patch("/api/requests/:requestId", (req, res) => {
   if (dispatch) {
     if (status === "accepted") {
       dispatch.status = "accepted";
+      if (dispatch.patientId && patientsCollection) {
+        await patientsCollection.findOneAndUpdate(
+          { patientId: dispatch.patientId },
+          {
+            $set: {
+              assignedHospitalId: record.hospitalId,
+              assignedHospitalName: record.hospitalName,
+              acceptedAt: new Date(),
+              etaMinutes: record.etaMins,
+              status: "accepted",
+              updatedAt: new Date(),
+            },
+          }
+        );
+      }
     } else if (status === "diverted") {
       const nextIndex = dispatch.currentIndex + 1;
       if (nextIndex < dispatch.chain.length) {
@@ -757,7 +967,7 @@ app.patch("/api/requests/:requestId", (req, res) => {
   }
 
   return res.json({ ok: true, requestId, status, dispatch: dispatch ?? null });
-});
+}));
 
 // --- Admin override endpoints ---
 
@@ -881,6 +1091,7 @@ function createRequest(dispatch, chainIndex, escalatedFromName) {
   requests[requestId] = {
     requestId,
     dispatchId: dispatch.dispatchId,
+    patientId: dispatch.patientId ?? null,
     chainIndex,
     hospitalId: entry.hospitalId,
     hospitalName: entry.hospitalName,
@@ -980,4 +1191,3 @@ function haversineMiles(lat1, lon1, lat2, lon2) {
     Math.cos(dToR(lat1)) * Math.cos(dToR(lat2)) * Math.sin(dLon / 2) ** 2;
   return earthMiles * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
-

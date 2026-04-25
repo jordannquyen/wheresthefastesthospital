@@ -6,25 +6,23 @@
  *     name:           string | null,
  *     age:            number | null,
  *     sex:            "male" | "female" | null,
- *     specification:  "stemi" | "stroke" | "trauma" | null,
- *     insurance:      "Government" | "Kaiser" | null,
- *     location:       { phrase: string } | null,
  *     chiefComplaint: string | null,        // primary presenting problem
- *     mechanism:      string | null,        // mechanism of injury/illness
- *     mentalStatus:   string | null,        // GCS score or AVPU level
- *     interventions:  string[] | null,      // treatments already applied
- *     vitals:         { bp: string|null, hr: number|null, spo2: number|null, rr: number|null },
+ *     condition:      "cardiac" | "stroke" | "trauma" | null,
+ *     severity:       "critical" | "high" | "moderate" | "low" | null,
+ *     insuranceProvider: "Government" | "Kaiser" | null,
+ *     bloodPressure:  string | null,
+ *     heartRate:      number | null,
+ *     oxygenSaturation: number | null,
+ *     respiratoryRate: number | null,
+ *     address:        string | null,
+ *     summary:        string | null,
+ *     confidence:     number | null,
  *     transcript:     string,
  *   }
- *
- * Fields align with what /api/patients (Mongo persistence) accepts:
- * `{ name, age, specification, location: { lat, lng }, status }`.
- * `status` is set by the app, not extracted; `location.lat/lng` come from
- * geocoding `location.phrase` upstream.
  */
 
-const SPEC_KEYWORDS = {
-  stemi: [
+const CONDITION_KEYWORDS = {
+  cardiac: [
     "stemi",
     "st elevation",
     "heart attack",
@@ -121,19 +119,25 @@ const NAME_STOPWORDS = new Set([
 export function extractPatient(rawTranscript) {
   const transcript = (rawTranscript || "").toString();
   const lower = transcript.toLowerCase();
+  const vitals = extractVitals(transcript);
+  const condition = pickByLastOccurrence(lower, CONDITION_KEYWORDS);
+  const chiefComplaint = extractChiefComplaint(transcript);
 
   return {
     name: extractName(transcript),
     age: extractAge(transcript),
     sex: extractSex(transcript),
-    specification: pickByLastOccurrence(lower, SPEC_KEYWORDS),
-    insurance: pickByLastOccurrence(lower, INSURANCE_KEYWORDS),
-    location: extractLocation(transcript),
-    chiefComplaint: extractChiefComplaint(transcript),
-    mechanism: extractMechanism(lower),
-    mentalStatus: extractMentalStatus(transcript),
-    interventions: extractInterventions(lower),
-    vitals: extractVitals(transcript),
+    condition,
+    severity: inferSeverity(vitals, lower),
+    insuranceProvider: pickByLastOccurrence(lower, INSURANCE_KEYWORDS),
+    address: extractLocation(transcript)?.phrase ?? null,
+    chiefComplaint,
+    bloodPressure: vitals.bp,
+    heartRate: vitals.hr,
+    oxygenSaturation: vitals.spo2,
+    respiratoryRate: vitals.rr,
+    summary: buildSummary({ age: extractAge(transcript), sex: extractSex(transcript), chiefComplaint, condition, vitals }),
+    confidence: 0.65,
     transcript: transcript.trim(),
   };
 }
@@ -290,4 +294,38 @@ function extractInterventions(lowerTranscript) {
     if (re.test(lowerTranscript)) found.push(label);
   }
   return found.length > 0 ? found : null;
+}
+
+function inferSeverity(vitals, lowerTranscript) {
+  if (
+    lowerTranscript.includes("unresponsive")
+    || lowerTranscript.includes("cardiac arrest")
+    || (vitals.spo2 != null && vitals.spo2 < 90)
+    || (vitals.hr != null && vitals.hr > 130)
+  ) {
+    return "critical";
+  }
+  if (
+    lowerTranscript.includes("worsening")
+    || lowerTranscript.includes("severe")
+    || (vitals.spo2 != null && vitals.spo2 < 94)
+    || (vitals.hr != null && vitals.hr > 110)
+  ) {
+    return "high";
+  }
+  return lowerTranscript.trim() ? "moderate" : null;
+}
+
+function buildSummary({ age, sex, chiefComplaint, condition, vitals }) {
+  const parts = [];
+  if (age || sex) parts.push(`${age ? `${age} year old` : "Patient"}${sex ? ` ${sex}` : ""}`);
+  if (chiefComplaint) parts.push(`with ${chiefComplaint}`);
+  else if (condition) parts.push(`with possible ${condition} emergency`);
+  const vitalParts = [
+    vitals.bp && `BP ${vitals.bp}`,
+    vitals.hr && `HR ${vitals.hr}`,
+    vitals.spo2 && `oxygen ${vitals.spo2}%`,
+  ].filter(Boolean);
+  if (vitalParts.length) parts.push(`Vitals: ${vitalParts.join(", ")}`);
+  return parts.length ? `${parts.join(". ")}.` : null;
 }
