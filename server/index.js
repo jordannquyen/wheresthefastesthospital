@@ -1,9 +1,12 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { randomUUID } from "node:crypto";
 import { Client } from "@googlemaps/google-maps-services-js";
 
 dotenv.config();
+
+const requests = {};
 
 const app = express();
 const googleMapsClient = new Client({});
@@ -353,6 +356,7 @@ async function computeRoute(origin, specification, insurance) {
       availableBeds,
       distanceMiles: traffic.distanceMiles,
       durationMins: traffic.durationMins,
+      status,
     };
   });
 
@@ -393,7 +397,7 @@ async function computeRoute(origin, specification, insurance) {
     specificationMatchFound: candidates.length > 0 || !normalizedSpecification,
     insurance: normalizedInsurance,
     insuranceMatchFound: !normalizedInsurance || candidates.some((node) => (node.acceptedInsurance ?? []).includes(normalizedInsurance)),
-    model: "rank by distanceMiles asc, then availableBeds desc",
+    model: "score = specialty × status × availableBeds / (ETA + waitMins)",
     closest,
     recommended,
     top3,
@@ -469,6 +473,30 @@ async function getTravelMetrics(origin, nodes) {
       durationMins,
     };
   });
+}
+
+function shouldAutoApprove(hospitalId) {
+  const state = getTelemetry().nodes[hospitalId];
+  if (!state) return false;
+  return deriveStatus(state.utilization) === "Open"
+    && state.availableBeds >= 5
+    && state.waitMins <= 60;
+}
+
+function deriveStatus(utilization) {
+  if (utilization >= 0.95) return "Diversion";
+  if (utilization >= 0.80) return "Saturation";
+  return "Open";
+}
+
+function scoreHospital(node, spec) {
+  const STATUS_MULTIPLIER = { Open: 1.0, Saturation: 0.5, Diversion: 0 };
+  const timeToTreatment = (node.durationMins + node.waitMins) || 1;
+  const specialty = spec
+    ? (node.centerTypes ?? []).includes(spec) ? 3.0 : 0.5
+    : 1.0;
+  const status = STATUS_MULTIPLIER[node.status] ?? 1.0;
+  return specialty * status * node.availableBeds / timeToTreatment;
 }
 
 function haversineMiles(lat1, lon1, lat2, lon2) {
