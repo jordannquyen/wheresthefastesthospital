@@ -1,0 +1,74 @@
+[
+  {
+    "id": "cedars",
+    "name": "Cedars-Sinai Medical Center",
+    "lat": 34.0752,
+    "lng": -118.3804,
+    "specialty": "Trauma",
+    "centerTypes": ["stemi", "trauma"],
+    "acceptedInsurance": ["Medicare", "Blue Cross", "Aetna", "United Healthcare"]
+  },
+  {
+    "id": "lacusc",
+    "name": "LAC+USC Medical Center",
+    "lat": 34.0605,
+    "lng": -118.2051,
+    "specialty": "Burn Center",
+    "centerTypes": ["trauma"],
+    "acceptedInsurance": ["Medicare", "Medicaid", "Blue Cross"]
+  },
+  {
+    "id": "ucla",
+    "name": "UCLA Ronald Reagan",
+    "lat": 34.0659,
+    "lng": -118.4452,
+    "specialty": "Cardiac",
+    "centerTypes": ["stemi", "stroke", "trauma"],
+    "acceptedInsurance": ["Medicare", "Blue Cross", "Aetna", "Cigna", "United Healthcare"]
+  },
+  {
+    "id": "california_hospital",
+    "name": "California Hospital Medical Center",
+    "lat": 34.0387,
+    "lng": -118.2665,
+    "specialty": "Stroke",
+    "centerTypes": ["stroke"],
+    "acceptedInsurance": ["Medicare", "Medicaid", "Aetna"]
+  },
+  {
+    "id": "hollywood",
+    "name": "Kaiser Permanente Hollywood",
+    "lat": 34.1017,
+    "lng": -118.3183,
+    "specialty": "Respiratory",
+    "centerTypes": [],
+    "acceptedInsurance": ["Kaiser", "Medicare"]
+  },
+  {
+    "id": "providence",
+    "name": "Providence Saint John's",
+    "lat": 34.0286,
+    "lng": -118.4863,
+    "specialty": "Trauma",
+    "centerTypes": ["stroke", "trauma"],
+    "acceptedInsurance": ["Medicare", "Blue Cross", "Cigna", "United Healthcare"]
+  },
+  {
+    "id": "white_memorial",
+    "name": "Adventist Health White Memorial",
+    "lat": 34.0668,
+    "lng": -118.206,
+    "specialty": "Cardiac",
+    "centerTypes": ["stemi"],
+    "acceptedInsurance": ["Medicare", "Medicaid", "Blue Cross", "Aetna"]
+  },
+  {
+    "id": "st_francis",
+    "name": "St. Francis Medical Center",
+    "lat": 33.968,
+    "lng": -118.1755,
+    "specialty": "Stroke",
+    "centerTypes": ["stemi", "stroke"],
+    "acceptedInsurance": ["Medicare", "Cigna", "United Healthcare"]
+  }
+]
