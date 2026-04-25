@@ -8,6 +8,8 @@ import {
   Polyline,
   useJsApiLoader,
 } from "@react-google-maps/api";
+import { useVoice } from "./hooks/useVoice.js";
+import { extractPatient } from "./lib/extractPatient.js";
 
 const isAdminMode = new URLSearchParams(window.location.search).has("admin");
 const centerGL = { lat: 20, lng: 0 };
@@ -37,8 +39,23 @@ function App() {
   const [mapZoom, setMapZoom] = useState(defaultZoom);
   const [dispatch, setDispatch] = useState(null);
   const [adminHospitals, setAdminHospitals] = useState([]);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [patientSummary, setPatientSummary] = useState(null);
   const addressInputRef = useRef(null);
   const mapRef = useRef(null);
+  const originRef = useRef(origin);
+  const voice = useVoice();
+
+  useEffect(() => {
+    originRef.current = origin;
+  }, [origin]);
+
+  useEffect(() => {
+    fetch("/api/health")
+      .then((response) => response.json())
+      .then((data) => setVoiceEnabled(Boolean(data?.voice)))
+      .catch(() => setVoiceEnabled(false));
+  }, []);
 
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
@@ -46,20 +63,62 @@ function App() {
     libraries: mapsLibraries,
   });
 
+  // The autocomplete input is uncontrolled (so Google Places can write
+  // selected suggestions into it without React clobbering them on the next
+  // render). Mirror locationAddress onto the DOM ref so programmatic updates
+  // — voice geocode, GPS reverse-geocode — still appear in the field.
+  useEffect(() => {
+    if (!addressInputRef.current) return;
+    if (addressInputRef.current.value !== locationAddress) {
+      addressInputRef.current.value = locationAddress ?? "";
+    }
+  }, [locationAddress, isLoaded]);
+
   useEffect(() => {
     const pulseInterval = setInterval(() => setPulseTick((c) => !c), 900);
     return () => clearInterval(pulseInterval);
   }, []);
 
+  // Run once after Google Maps SDK is loaded: ask for GPS, reverse-geocode it,
+  // populate the address field, and route from there. Tracked with a ref so
+  // we don't re-run if isLoaded toggles.
+  const didAutofillGpsRef = useRef(false);
   useEffect(() => {
-    if (!navigator.geolocation) return;
-    navigator.geolocation.getCurrentPosition(async (pos) => {
-      const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-      setResolvedAddress("Current location");
-      await fetchHospitalsByCoords(loc.lat, loc.lng);
-      await requestRecommendations(loc);
+    if (!isLoaded || didAutofillGpsRef.current) return;
+    if (!navigator.geolocation || !window.google?.maps?.Geocoder) return;
+    didAutofillGpsRef.current = true;
+
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const loc = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        const formatted = await reverseGeocode(loc);
+        const display = formatted ?? `${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}`;
+        setLocationAddress(display);
+        setResolvedAddress(display);
+        await fetchHospitalsByCoords(loc.lat, loc.lng);
+        await requestRecommendations(loc);
+      },
+      (err) => {
+        console.warn("Geolocation failed:", err);
+        setLocationError(`Couldn't get current location: ${err.message}`);
+      },
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 60_000 },
+    );
+  }, [isLoaded]);
+
+  function reverseGeocode(loc) {
+    return new Promise((resolve) => {
+      const geocoder = new window.google.maps.Geocoder();
+      geocoder.geocode({ location: loc }, (results, status) => {
+        if (status === "OK" && results?.[0]) {
+          resolve(results[0].formatted_address);
+        } else {
+          console.warn("Reverse geocode failed:", status);
+          resolve(null);
+        }
+      });
     });
-  }, []);
+  }
 
   // Poll hospital requests while on hospital tab
   useEffect(() => {
@@ -206,16 +265,76 @@ function App() {
     await requestRecommendations(clickOrigin);
   }
 
-  async function requestRecommendations(inputOrigin) {
+  async function handleTalkToggle() {
+    if (voice.isListening) {
+      const transcript = await voice.stop();
+      if (!transcript) {
+        if (voice.error) {
+          await voice.speak("Sorry, I didn't catch that. Try again.");
+        }
+        return;
+      }
+
+      const summary = extractPatient(transcript);
+      setPatientSummary(summary);
+      if (summary.insurance) setInsurance(summary.insurance);
+
+      let geocoded = null;
+      let resolvedOrigin = originRef.current;
+      if (summary.location?.phrase) {
+        geocoded = await geocodeVoiceLocation(summary.location.phrase);
+        if (geocoded) {
+          resolvedOrigin = geocoded.location;
+          setLocationAddress(geocoded.formattedAddress);
+          setResolvedAddress(geocoded.formattedAddress);
+          setLocationError("");
+          await fetchHospitalsByCoords(resolvedOrigin.lat, resolvedOrigin.lng);
+        }
+      }
+
+      const reply = buildVoiceReply(summary, resolvedOrigin, geocoded);
+      voice.speak(reply);
+
+      if (resolvedOrigin && geocoded) {
+        await requestRecommendations(resolvedOrigin, {
+          insurance: summary.insurance,
+        });
+      }
+    } else {
+      setPatientSummary(null);
+      await voice.start();
+    }
+  }
+
+  async function geocodeVoiceLocation(phrase) {
+    try {
+      const res = await fetch("/api/geocode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: phrase }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.location) return null;
+      return {
+        formattedAddress: data.formattedAddress ?? phrase,
+        location: data.location,
+      };
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  async function requestRecommendations(inputOrigin, overrides = {}) {
     setOrigin(inputOrigin);
     setSentRequests({});
     setDispatch(null);
+    const effectiveInsurance = overrides.insurance ?? insurance;
     const res = await fetch("/api/route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         origin: inputOrigin,
-        insurance: insurance || null,
+        insurance: effectiveInsurance || null,
       }),
     });
     const data = await res.json();
@@ -451,7 +570,71 @@ function App() {
               </div>
             </article>
 
-            <aside className="grid min-h-0 grid-rows-[auto_auto_1fr] gap-4">
+            <aside className="grid min-h-0 grid-rows-[auto_auto_auto_1fr] gap-4">
+              <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold">Voice Intake</h2>
+                  <span className={`font-mono text-[10px] uppercase tracking-[0.2em] ${voiceEnabled ? "text-emerald-300" : "text-slate-500"}`}>
+                    {voiceEnabled ? "ElevenLabs ready" : "voice offline"}
+                  </span>
+                </div>
+                <p className="mt-1 text-sm text-slate-300">
+                  Tap the mic, describe the patient, then tap again to stop. Condition and vitals are extracted automatically.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleTalkToggle}
+                  disabled={!voiceEnabled || voice.isProcessing}
+                  className={`mt-3 flex w-full items-center justify-center gap-2 rounded-lg px-3 py-3 text-sm font-semibold transition ${
+                    voice.isListening
+                      ? "bg-red-500 text-white hover:bg-red-400"
+                      : "bg-cyan-500 text-slate-950 hover:bg-cyan-400"
+                  } ${(!voiceEnabled || voice.isProcessing) ? "cursor-not-allowed opacity-60" : ""}`}
+                >
+                  <span className={`inline-block h-2.5 w-2.5 rounded-full ${voice.isListening ? "animate-pulse bg-white" : "bg-slate-950/60"}`}></span>
+                  {voice.isListening
+                    ? "Listening — tap to stop"
+                    : voice.isProcessing
+                      ? "Transcribing…"
+                      : voice.isSpeaking
+                        ? "Speaking…"
+                        : "Tap to talk"}
+                </button>
+                {voice.error && (
+                  <p className="mt-2 text-xs text-red-300">{voice.error}</p>
+                )}
+                {patientSummary && (
+                  <div className="mt-3 space-y-1.5 rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-200">
+                    <p className="font-mono uppercase tracking-wide text-cyan-300">Patient summary</p>
+                    {patientSummary.name && (
+                      <p>Name: <span className="font-semibold text-white">{patientSummary.name}</span></p>
+                    )}
+                    {(patientSummary.age || patientSummary.sex) && (
+                      <p>Demographics: {[patientSummary.age && `${patientSummary.age}y`, patientSummary.sex].filter(Boolean).join(", ")}</p>
+                    )}
+                    {patientSummary.specification && (
+                      <p>Suspected: <span className="font-semibold text-white">{patientSummary.specification.toUpperCase()}</span></p>
+                    )}
+                    {patientSummary.insurance && (
+                      <p>Insurance: <span className="font-semibold text-white">{patientSummary.insurance}</span></p>
+                    )}
+                    {patientSummary.location?.phrase && (
+                      <p>Location heard: <span className="font-semibold text-white">{patientSummary.location.phrase}</span></p>
+                    )}
+                    {(patientSummary.vitals.bp || patientSummary.vitals.hr || patientSummary.vitals.spo2) && (
+                      <p>Vitals: {[
+                        patientSummary.vitals.bp && `BP ${patientSummary.vitals.bp}`,
+                        patientSummary.vitals.hr && `HR ${patientSummary.vitals.hr}`,
+                        patientSummary.vitals.spo2 && `SpO₂ ${patientSummary.vitals.spo2}%`,
+                      ].filter(Boolean).join(" · ")}</p>
+                    )}
+                    {patientSummary.transcript && (
+                      <p className="mt-1 text-slate-400">"{patientSummary.transcript}"</p>
+                    )}
+                  </div>
+                )}
+              </section>
+
               <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
                 <h2 className="text-lg font-semibold">Current Location</h2>
                 <p className="mt-1 text-sm text-slate-300">Use address autofill or click the map, then compute top 3 hospitals.</p>
@@ -607,6 +790,35 @@ function App() {
       </section>
     </main>
   );
+}
+
+function buildVoiceReply(summary, resolvedOrigin, geocoded) {
+  const specLabels = { stemi: "STEMI", stroke: "stroke", trauma: "trauma" };
+  const parts = [];
+
+  if (summary.specification) {
+    parts.push(`Heard ${specLabels[summary.specification]} symptoms.`);
+  } else {
+    parts.push("Got it.");
+  }
+
+  if (summary.insurance) {
+    parts.push(`Insurance noted as ${summary.insurance}.`);
+  }
+
+  if (geocoded) {
+    parts.push(`Pinned location at ${geocoded.formattedAddress}.`);
+  } else if (summary.location?.phrase && !geocoded) {
+    parts.push(`I couldn't pin "${summary.location.phrase}" on the map. Confirm the address.`);
+  }
+
+  if (resolvedOrigin) {
+    parts.push("Computing the route now.");
+  } else {
+    parts.push("Set the patient's location to compute the route.");
+  }
+
+  return parts.join(" ");
 }
 
 function AdminView({ hospitals, onOverride }) {
