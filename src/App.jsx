@@ -307,6 +307,19 @@ function App() {
 
       let geocoded = null;
       let resolvedOrigin = originRef.current;
+
+      // If no origin yet (geolocation hadn't fired), fetch it now
+      if (!resolvedOrigin && navigator.geolocation) {
+        resolvedOrigin = await new Promise((resolve) => {
+          navigator.geolocation.getCurrentPosition(
+            (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+            () => resolve(null),
+            { timeout: 5000 }
+          );
+        });
+        if (resolvedOrigin) await fetchHospitalsByCoords(resolvedOrigin.lat, resolvedOrigin.lng);
+      }
+
       if (summary.location?.phrase) {
         geocoded = await geocodeVoiceLocation(summary.location.phrase);
         if (geocoded) {
