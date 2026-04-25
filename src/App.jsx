@@ -527,24 +527,30 @@ function App() {
                     </p>
                     {route.closest && <p>Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)</p>}
                     <div className="space-y-2 pt-1">
-                      {(route.top3 || []).map((candidate, index) => (
+                      {(route.top3 || []).map((candidate, index) => {
+                        const chainEntry = dispatch?.chain?.find((e) => e.hospitalId === candidate.id);
+                        return (
                         <div key={candidate.id} className="rounded-md border border-slate-700 bg-slate-900/60 p-2">
                           <p className="flex items-center gap-2 font-medium text-slate-100">
                             <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-cyan-500/20 text-sm font-bold text-cyan-300">{rankLabels[index]}</span>
                             <span className="inline-block h-2.5 w-2.5 flex-shrink-0 rounded-full" style={{ backgroundColor: getNodeColor(candidate.utilization) }} />
                             {candidate.name}
-                            {index === 0 && dispatch?.activeRequest?.autoApproved && (
+                            {chainEntry?.requestStatus === "diverted" && (
+                              <span className="rounded-full border border-amber-400/40 bg-amber-400/15 px-2 py-0.5 text-xs font-semibold text-amber-300">Rerouted</span>
+                            )}
+                            {chainEntry?.requestStatus === "accepted" && chainEntry?.autoApproved && (
                               <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">Auto-Accepted</span>
                             )}
-                            {index === 0 && dispatch?.activeRequest?.escalatedFrom && (
-                              <span className="rounded-full border border-orange-400/40 bg-orange-400/15 px-2 py-0.5 text-xs font-semibold text-orange-300">Rerouted from {dispatch.activeRequest.escalatedFrom}</span>
+                            {chainEntry?.requestStatus === "accepted" && !chainEntry?.autoApproved && (
+                              <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">Accepted</span>
                             )}
                           </p>
                           <p className="mt-1 text-xs text-slate-300">
                             {candidate.distanceMiles} mi | {candidate.availableBeds} beds avail | {Math.round(candidate.utilization * 100)}% util | {candidate.waitMins} min wait
                           </p>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
 
                     {!dispatch ? (
@@ -673,7 +679,9 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
                 <div className="flex flex-wrap items-center gap-2">
                   {req.escalatedFrom && <span className="rounded-full border border-orange-400/30 bg-orange-400/10 px-2.5 py-1 text-xs font-semibold text-orange-200">Rerouted from {req.escalatedFrom}</span>}
                   {req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Auto-Approved</span>}
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${requestStatusClass(req.status)}`}>{req.status.charAt(0).toUpperCase() + req.status.slice(1)}</span>
+                  {req.status === "accepted" && !req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Accepted</span>}
+                  {req.status === "diverted" && <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-200">Diverted</span>}
+                  {req.status === "pending" && <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-200">Pending</span>}
                 </div>
                 <p className="mt-3 font-semibold text-slate-100">{req.hospitalName}</p>
                 <div className="mt-2 space-y-1 text-sm text-slate-300">
@@ -718,11 +726,6 @@ function dispatchPanelClass(status) {
   return "border-cyan-500/40 bg-cyan-500/10 text-cyan-200";
 }
 
-function requestStatusClass(status) {
-  if (status === "accepted") return "border border-emerald-500/30 bg-emerald-500/10 text-emerald-200";
-  if (status === "diverted") return "border border-red-500/30 bg-red-500/10 text-red-200";
-  return "border border-amber-500/30 bg-amber-500/10 text-amber-200";
-}
 
 function statusBadgeColor(status) {
   switch (status) {

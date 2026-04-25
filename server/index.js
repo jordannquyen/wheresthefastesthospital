@@ -549,7 +549,7 @@ app.get("/api/dispatch/:dispatchId", (req, res) => {
     const r = Object.values(requests).find(
       (r) => r.dispatchId === dispatch.dispatchId && r.chainIndex === index
     );
-    return { ...entry, requestStatus: r?.status ?? null, requestId: r?.requestId ?? null };
+    return { ...entry, requestStatus: r?.status ?? null, requestId: r?.requestId ?? null, autoApproved: r?.autoApproved ?? false };
   });
 
   return res.json({
@@ -716,8 +716,9 @@ function createRequest(dispatch, chainIndex, escalatedFromName) {
 function shouldAutoApprove(hospitalId, nodeMetrics) {
   const override = hospitalOverrides[hospitalId];
   const utilization = nodeMetrics?.utilization ?? 0;
-  const status = override ?? deriveStatus(utilization);
-  return status === "Open"
+  // Only auto-accept green-level hospitals (<50% util). Respect explicit "Open" admin overrides.
+  const isGreen = override === "Open" || (!override && utilization < 0.5);
+  return isGreen
     && (nodeMetrics?.availableBeds ?? 0) >= 5
     && (nodeMetrics?.waitMins ?? 999) <= 60;
 }
