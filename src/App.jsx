@@ -569,12 +569,7 @@ function App() {
                           </>
                         )}
                         {dispatch.status === "accepted" && (
-                          <div className="flex items-center gap-2">
-                            <p className="font-semibold">Confirmed — heading to {dispatch.currentHospital?.hospitalName}</p>
-                            {dispatch.activeRequest?.autoApproved && (
-                              <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">Auto-Accepted</span>
-                            )}
-                          </div>
+                          <p className="font-semibold">Confirmed — heading to {dispatch.currentHospital?.hospitalName}</p>
                         )}
                         {dispatch.status === "exhausted" && (
                           <p className="font-semibold">All hospitals diverted — contact dispatch</p>
