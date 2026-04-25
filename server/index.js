@@ -113,6 +113,82 @@ function deduplicateByLatestWeek(rawRecords) {
   return [...seen.values()];
 }
 
+// Socrata uses -999999 as a sentinel for unreported values; treat those (and any negative) as 0.
+function parseBedCount(val) {
+  const n = parseFloat(val);
+  return isFinite(n) && n >= 0 ? n : 0;
+}
+
+function mapSocrataBeds(h) {
+  const inpatientTotal = parseBedCount(h.inpatient_beds_7_day_avg);
+  const inpatientUsed = Math.min(parseBedCount(h.inpatient_beds_used_7_day_avg), inpatientTotal || Infinity);
+  const icuTotal = parseBedCount(h.total_staffed_adult_icu_beds_7_day_avg);
+  const icuUsed = Math.min(parseBedCount(h.staffed_adult_icu_bed_occupancy_7_day_avg), icuTotal || Infinity);
+  return {
+    inpatient_total: inpatientTotal,
+    inpatient_used: inpatientUsed,
+    inpatient_utilization: inpatientTotal > 0 ? Math.round((inpatientUsed / inpatientTotal) * 100) : 0,
+    icu_total: icuTotal,
+    icu_used: icuUsed,
+    icu_utilization: icuTotal > 0 ? Math.round((icuUsed / icuTotal) * 100) : 0,
+  };
+}
+
+// --- NPI Registry integration ---
+
+// hospital_pk → { npiResult: object|null, ts: number }
+const npiCache = new Map();
+const NPI_CACHE_TTL = 86_400_000; // 24h — NPI data changes rarely
+
+async function fetchNpiData(hospitalName, city, state) {
+  try {
+    const url = new URL("https://npiregistry.cms.hhs.gov/api/");
+    url.searchParams.set("version", "2.1");
+    url.searchParams.set("enumeration_type", "NPI-2");
+    // Use first 4 words to avoid exact-match failures on long names
+    url.searchParams.set("organization_name", hospitalName.split(" ").slice(0, 4).join(" "));
+    url.searchParams.set("state", state);
+    url.searchParams.set("limit", "5");
+
+    const res = await fetch(url.toString(), { signal: AbortSignal.timeout(2500) });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const results = json.results ?? [];
+    // Prefer a result whose address matches the hospital city
+    return (
+      results.find((r) =>
+        r.addresses?.some((a) => a.city?.toUpperCase() === city?.toUpperCase())
+      ) ?? results[0] ?? null
+    );
+  } catch {
+    return null;
+  }
+}
+
+async function fetchAndCacheNpi(h) {
+  const cached = npiCache.get(h.hospital_pk);
+  if (cached && Date.now() - cached.ts < NPI_CACHE_TTL) return;
+  const npiResult = await fetchNpiData(h.hospital_name, h.city, h.state);
+  npiCache.set(h.hospital_pk, { npiResult, ts: Date.now() });
+}
+
+// Infer accepted insurances from CMS certification number, hospital subtype, and NPI taxonomy codes.
+// STEMI/stroke/trauma center designation requires state EMS / Joint Commission certification databases
+// not available from NPPES — those centerTypes remain unpopulated until a richer source is integrated.
+function inferInsurance(h) {
+  const name = (h.hospital_name ?? "").toUpperCase();
+
+  // Kaiser operates a closed network — patients with Kaiser insurance must use these facilities.
+  // Kaiser hospitals also participate in Medicare/Medicaid, so they carry both tags.
+  if (name.includes("KAISER")) return ["Kaiser", "Government"];
+
+  // CCN presence means CMS-certified → accepts Medicare and Medicaid.
+  // This is the only commercially verifiable insurance fact from public data.
+  if (h.ccn) return ["Government"];
+
+  return [];
+}
+
 async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
   const key = `${lat.toFixed(2)},${lng.toFixed(2)}`;
   if (distanceCache.key === key && Date.now() - distanceCache.ts < DISTANCE_CACHE_TTL) {
@@ -128,41 +204,43 @@ async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
     if (!response.ok) throw new Error(`Socrata API returned ${response.status}`);
 
     const raw = await response.json();
-    const hospitals = deduplicateByLatestWeek(raw.filter((h) => h.geocoded_hospital_address));
+    const deduplicated = deduplicateByLatestWeek(raw.filter((h) => h.geocoded_hospital_address));
 
-    const mapped = hospitals.map((h) => {
+    // Filter to in-range hospitals with valid bed data before NPI enrichment
+    const inRange = deduplicated.filter((h) => {
       const coords = h.geocoded_hospital_address?.coordinates;
-      const inpatientUsed = parseFloat(h.inpatient_beds_used_7_day_avg) || 0;
-      const inpatientTotal = parseFloat(h.inpatient_beds_7_day_avg) || 1;
-      const icuUsed = parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0;
-      const icuTotal = parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 1;
-      const hospitalLat = coords ? coords[1] : null;
-      const hospitalLng = coords ? coords[0] : null;
-      const distance = hospitalLat && hospitalLng ? haversineMiles(lat, lng, hospitalLat, hospitalLng) : 999;
-
-      return {
-        id: h.hospital_pk,
-        name: toTitleCase(h.hospital_name),
-        lat: hospitalLat,
-        lng: hospitalLng,
-        address: h.address,
-        city: h.city,
-        state: h.state,
-        zip: h.zip,
-        distance: Number(distance.toFixed(2)),
-        beds: {
-          inpatient_total: inpatientTotal,
-          inpatient_used: inpatientUsed,
-          inpatient_utilization: Math.round((inpatientUsed / inpatientTotal) * 100),
-          icu_total: icuTotal,
-          icu_used: icuUsed,
-          icu_utilization: Math.round((icuUsed / icuTotal) * 100),
-        },
-        collectionDate: h.collection_week,
-      };
+      if (!coords) return false;
+      const beds = mapSocrataBeds(h);
+      if (beds.inpatient_total === 0) return false;
+      return haversineMiles(lat, lng, coords[1], coords[0]) <= radiusMiles;
     });
 
-    const result = mapped.filter((h) => h.distance <= radiusMiles).sort((a, b) => a.distance - b.distance);
+    // Fetch NPI data for any hospitals not yet in cache (parallel, best-effort)
+    await Promise.allSettled(inRange.map((h) => fetchAndCacheNpi(h)));
+
+    const result = inRange
+      .map((h) => {
+        const coords = h.geocoded_hospital_address.coordinates;
+        const hospitalLat = coords[1];
+        const hospitalLng = coords[0];
+        const npiResult = npiCache.get(h.hospital_pk)?.npiResult ?? null;
+        return {
+          id: h.hospital_pk,
+          name: toTitleCase(h.hospital_name),
+          lat: hospitalLat,
+          lng: hospitalLng,
+          address: h.address,
+          city: h.city,
+          state: h.state,
+          zip: h.zip,
+          distance: Number(haversineMiles(lat, lng, hospitalLat, hospitalLng).toFixed(2)),
+          beds: mapSocrataBeds(h),
+          acceptedInsurance: inferInsurance(h),
+          collectionDate: h.collection_week,
+        };
+      })
+      .sort((a, b) => a.distance - b.distance);
+
     distanceCache = { key, result, ts: Date.now() };
     return result;
   } catch (error) {
@@ -195,32 +273,26 @@ async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit 
     if (!response.ok) throw new Error(`Socrata API returned ${response.status}`);
 
     const raw = await response.json();
-    const hospitals = deduplicateByLatestWeek(raw.filter((h) => h.geocoded_hospital_address));
+    const valid = deduplicateByLatestWeek(
+      raw.filter((h) => h.geocoded_hospital_address && mapSocrataBeds(h).inpatient_total > 0)
+    );
 
-    cachedHospitals = hospitals.map((h) => {
-      const coords = h.geocoded_hospital_address?.coordinates;
-      const inpatientUsed = parseFloat(h.inpatient_beds_used_7_day_avg) || 0;
-      const inpatientTotal = parseFloat(h.inpatient_beds_7_day_avg) || 1;
-      const icuUsed = parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0;
-      const icuTotal = parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 1;
+    await Promise.allSettled(valid.map((h) => fetchAndCacheNpi(h)));
 
+    cachedHospitals = valid.map((h) => {
+      const coords = h.geocoded_hospital_address.coordinates;
+      const npiResult = npiCache.get(h.hospital_pk)?.npiResult ?? null;
       return {
         id: h.hospital_pk,
         name: toTitleCase(h.hospital_name),
-        lat: coords ? coords[1] : null,
-        lng: coords ? coords[0] : null,
+        lat: coords[1],
+        lng: coords[0],
         address: h.address,
         city: h.city,
         state: h.state,
         zip: h.zip,
-        beds: {
-          inpatient_total: inpatientTotal,
-          inpatient_used: inpatientUsed,
-          inpatient_utilization: Math.round((inpatientUsed / inpatientTotal) * 100),
-          icu_total: icuTotal,
-          icu_used: icuUsed,
-          icu_utilization: Math.round((icuUsed / icuTotal) * 100),
-        },
+        beds: mapSocrataBeds(h),
+        acceptedInsurance: inferInsurance(h),
         collectionDate: h.collection_week,
       };
     });
@@ -382,6 +454,7 @@ app.get("/api/hospitals", async (req, res) => {
       .filter((h) => h.geocoded_hospital_address)
       .map((h) => {
         const coords = h.geocoded_hospital_address?.coordinates;
+        const beds = mapSocrataBeds(h);
         return {
           id: h.hospital_pk,
           name: toTitleCase(h.hospital_name),
@@ -390,20 +463,7 @@ app.get("/api/hospitals", async (req, res) => {
           state: h.state,
           zip: h.zip,
           location: coords ? { lat: coords[1], lng: coords[0] } : null,
-          beds: {
-            inpatient_total: parseFloat(h.inpatient_beds_7_day_avg) || 0,
-            inpatient_used: parseFloat(h.inpatient_beds_used_7_day_avg) || 0,
-            inpatient_utilization:
-              h.inpatient_beds_used_7_day_avg && h.inpatient_beds_7_day_avg
-                ? Math.round(
-                    (parseFloat(h.inpatient_beds_used_7_day_avg) /
-                      parseFloat(h.inpatient_beds_7_day_avg)) *
-                      100
-                  )
-                : 0,
-            icu_total: parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 0,
-            icu_used: parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0,
-          },
+          beds,
           collectionDate: h.collection_week,
         };
       });
@@ -440,12 +500,12 @@ app.post("/api/geocode", async (req, res) => {
 });
 
 app.post("/api/route", async (req, res) => {
-  const { origin, specification, insurance } = req.body ?? {};
+  const { origin, insurance } = req.body ?? {};
   if (!origin || typeof origin.lat !== "number" || typeof origin.lng !== "number") {
     return res.status(400).json({ error: "origin.lat and origin.lng are required numeric fields" });
   }
   try {
-    const routeResult = await computeRoute(origin, specification, insurance);
+    const routeResult = await computeRoute(origin, insurance);
     res.json(routeResult);
   } catch (error) {
     console.error("Routing error", error);
@@ -456,7 +516,7 @@ app.post("/api/route", async (req, res) => {
 // --- Dispatch endpoints ---
 
 app.post("/api/dispatch", (req, res) => {
-  const { chain, patientSpec, insurance } = req.body ?? {};
+  const { chain, insurance } = req.body ?? {};
   if (!Array.isArray(chain) || chain.length === 0) {
     return res.status(400).json({ error: "chain must be a non-empty array" });
   }
@@ -466,7 +526,6 @@ app.post("/api/dispatch", (req, res) => {
     dispatchId,
     chain,
     currentIndex: 0,
-    patientSpec: patientSpec ?? null,
     insurance: insurance ?? null,
     activeRequestId: null,
     status: "active",
@@ -500,7 +559,6 @@ app.get("/api/dispatch/:dispatchId", (req, res) => {
     currentHospital: dispatch.chain[dispatch.currentIndex] ?? null,
     activeRequest,
     chain: chainWithStatus,
-    patientSpec: dispatch.patientSpec,
     insurance: dispatch.insurance,
   });
 });
@@ -581,9 +639,8 @@ initializeMongo()
 
 // --- Routing pipeline ---
 
-async function computeRoute(origin, specification, insurance) {
+async function computeRoute(origin, insurance) {
   const allNodes = await fetchHospitalsByDistance(origin.lat, origin.lng, 50);
-  const normalizedSpecification = normalizeSpecification(specification);
   const normalizedInsurance = normalizeInsurance(insurance);
   const nodes = allNodes.slice(0, 25);
   const trafficResults = await getTravelMetrics(origin, nodes);
@@ -606,38 +663,29 @@ async function computeRoute(origin, specification, insurance) {
     };
   });
 
-  const ranked = [...scored].sort(
-    (a, b) => scoreHospital(b, normalizedSpecification) - scoreHospital(a, normalizedSpecification)
-  );
+  const ranked = [...scored].sort((a, b) => scoreHospital(b) - scoreHospital(a));
 
-  let candidates = normalizedSpecification
-    ? ranked.filter((node) => (node.centerTypes ?? []).includes(normalizedSpecification))
+  let candidates = ranked;
+  const insurancePool = normalizedInsurance
+    ? ranked.filter((node) => (node.acceptedInsurance ?? []).includes(normalizedInsurance))
     : ranked;
+  if (insurancePool.length > 0) candidates = insurancePool;
 
-  if (normalizedInsurance) {
-    candidates = candidates.filter((node) =>
-      (node.acceptedInsurance ?? []).includes(normalizedInsurance)
-    );
-  }
+  const insuranceMatchFound = !normalizedInsurance || insurancePool.length > 0;
 
-  const activeRanking = candidates.length > 0 ? candidates : ranked;
-  const top3 = activeRanking.slice(0, 3);
+  const top3 = candidates.slice(0, 3);
   const closest = [...scored].sort((a, b) => a.distanceMiles - b.distanceMiles)[0];
   const recommended = top3[0] ?? closest;
 
   return {
     origin,
-    specification: normalizedSpecification,
-    specificationMatchFound: candidates.length > 0 || !normalizedSpecification,
     insurance: normalizedInsurance,
-    insuranceMatchFound:
-      !normalizedInsurance ||
-      candidates.some((node) => (node.acceptedInsurance ?? []).includes(normalizedInsurance)),
-    model: "score = specialty x status x availableBeds / (ETA + waitMins)",
+    insuranceMatchFound,
+    model: "score = status / (ETA² + waitMins)",
     closest,
     recommended,
     top3,
-    candidates: activeRanking,
+    candidates,
     provider: googleMapsApiKey ? "google" : "fallback",
     generatedAt: new Date().toISOString(),
   };
@@ -655,7 +703,6 @@ function createRequest(dispatch, chainIndex, escalatedFromName) {
     chainIndex,
     hospitalId: entry.hospitalId,
     hospitalName: entry.hospitalName,
-    patientSpec: dispatch.patientSpec,
     insurance: dispatch.insurance,
     etaMins: entry.etaMins,
     escalatedFrom: escalatedFromName ?? null,
@@ -680,32 +727,25 @@ function getEffectiveStatus(hospitalId, utilization) {
 }
 
 function deriveStatus(utilization) {
-  if (utilization >= 0.95) return "Diversion";
+  if (utilization >= 0.97) return "Diversion";
   if (utilization >= 0.80) return "Saturation";
   return "Open";
 }
 
-function scoreHospital(node, spec) {
+function scoreHospital(node) {
   const STATUS_MULTIPLIER = { Open: 1.0, Saturation: 0.5, Diversion: 0 };
-  const timeToTreatment = (node.durationMins + node.waitMins) || 1;
-  const specialty = spec
-    ? (node.centerTypes ?? []).includes(spec) ? 3.0 : 0.5
-    : 1.0;
+  const eta = node.durationMins || 1;
+  const waitMins = node.waitMins || 1;
   const status = STATUS_MULTIPLIER[node.status] ?? 1.0;
-  return (specialty * status * node.availableBeds) / timeToTreatment;
-}
-
-function normalizeSpecification(input) {
-  if (!input || typeof input !== "string") return null;
-  const normalized = input.trim().toLowerCase();
-  return ["stemi", "stroke", "trauma"].includes(normalized) ? normalized : null;
+  // ETA² dominates: 2× farther → 4× penalty. Status (which encodes bed availability
+  // via utilization) breaks ties. waitMins is the final tiebreaker.
+  return status / (eta ** 2 + waitMins);
 }
 
 function normalizeInsurance(input) {
   if (!input || typeof input !== "string") return null;
   const normalized = input.trim();
-  const valid = ["Medicare", "Medicaid", "Blue Cross", "Aetna", "United Healthcare", "Cigna", "Kaiser"];
-  return valid.includes(normalized) ? normalized : null;
+  return ["Government", "Kaiser"].includes(normalized) ? normalized : null;
 }
 
 async function getTravelMetrics(origin, nodes) {
@@ -753,3 +793,4 @@ function haversineMiles(lat1, lon1, lat2, lon2) {
     Math.cos(dToR(lat1)) * Math.cos(dToR(lat2)) * Math.sin(dLon / 2) ** 2;
   return earthMiles * (2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
+

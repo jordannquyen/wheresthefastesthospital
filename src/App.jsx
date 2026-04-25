@@ -27,7 +27,6 @@ function App() {
   const [locationAddress, setLocationAddress] = useState("");
   const [resolvedAddress, setResolvedAddress] = useState("");
   const [locationError, setLocationError] = useState("");
-  const [specification, setSpecification] = useState("");
   const [insurance, setInsurance] = useState("");
   const [addressAutocomplete, setAddressAutocomplete] = useState(null);
   const [activeTab, setActiveTab] = useState("emt");
@@ -139,7 +138,6 @@ function App() {
           availableBeds: candidate.availableBeds,
           waitMins: candidate.waitMins,
         }],
-        patientSpec: specification || null,
         insurance: insurance || null,
       }),
     });
@@ -160,7 +158,7 @@ function App() {
     const res = await fetch("/api/dispatch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ chain, patientSpec: specification || null, insurance: insurance || null }),
+      body: JSON.stringify({ chain, insurance: insurance || null }),
     });
     const data = await res.json();
     if (res.ok) {
@@ -217,16 +215,15 @@ function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         origin: inputOrigin,
-        specification: specification || null,
         insurance: insurance || null,
       }),
     });
     const data = await res.json();
     setRoute(data);
     setProvider(data.provider ?? "fallback");
-    if (data.specification && !data.specificationMatchFound) {
+    if (data.insurance && !data.insuranceMatchFound) {
       setLocationError(
-        `No ${data.specification.toUpperCase()} center match found, showing nearest-capacity fallback.`,
+        `No hospitals accepting ${data.insurance} found nearby, showing best available options.`,
       );
     }
   }
@@ -352,7 +349,7 @@ function App() {
                   {nodes.map((node) => {
                     const util = nodeUtilization(node);
                     const color = getNodeColor(util);
-                    const congested = util >= 0.9;
+                    const congested = util >= 0.97;
                     return (
                       <Circle
                         key={`circle-${node.id}`}
@@ -381,7 +378,7 @@ function App() {
                         onClick={() => setSelectedHospitalId(node.id)}
                         icon={{
                           path: window.google.maps.SymbolPath.CIRCLE,
-                          scale: 8,
+                          scale: util >= 0.97 && pulseTick ? 10 : 8,
                           fillColor: getNodeColor(util),
                           fillOpacity: 1,
                           strokeColor: "#e2e8f0",
@@ -446,8 +443,8 @@ function App() {
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-200">Legend</p>
                 <ul className="mt-2 space-y-1.5 text-xs text-slate-300">
                   <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" />Green: &lt;50% util</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 50-89% util</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500" />Red pulse: 90%+ util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 50-97% util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500" />Red pulse: 97%+ util</li>
                   <li><span className="mr-2 inline-block h-[2px] w-6 bg-sky-400 align-middle" />Top recommendation</li>
                   <li><span className="mr-2 inline-block h-[2px] w-6 border-b border-dashed border-slate-400 align-middle" />Closest baseline</li>
                 </ul>
@@ -482,21 +479,10 @@ function App() {
                       placeholder="Loading autocomplete..."
                     />
                   )}
-                  <select value={specification} onChange={(e) => setSpecification(e.target.value)} className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
-                    <option value="">Specification (optional)</option>
-                    <option value="stemi">STEMI</option>
-                    <option value="stroke">Stroke</option>
-                    <option value="trauma">Trauma</option>
-                  </select>
                   <select value={insurance} onChange={(e) => setInsurance(e.target.value)} className="rounded-md border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
-                    <option value="">Insurance (optional)</option>
-                    <option value="Medicare">Medicare</option>
-                    <option value="Medicaid">Medicaid</option>
-                    <option value="Blue Cross">Blue Cross</option>
-                    <option value="Aetna">Aetna</option>
-                    <option value="United Healthcare">United Healthcare</option>
-                    <option value="Cigna">Cigna</option>
-                    <option value="Kaiser">Kaiser</option>
+                    <option value="">Insurance (any)</option>
+                    <option value="Government">Government (Medicare / Medicaid)</option>
+                    <option value="Kaiser">Kaiser Permanente</option>
                   </select>
                   <button type="submit" className="rounded-md bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400">
                     Get Top 3 Hospitals
@@ -539,11 +525,6 @@ function App() {
                     <p className="rounded-md border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
                       Model: <span className="font-mono text-cyan-300">{route.model}</span>
                     </p>
-                    {route.specification && (
-                      <p className="rounded-md border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
-                        Spec: <span className="font-mono text-cyan-300">{route.specification.toUpperCase()}</span>
-                      </p>
-                    )}
                     {route.closest && <p>Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)</p>}
                     <div className="space-y-2 pt-1">
                       {(route.top3 || []).map((candidate, index) => (
@@ -690,7 +671,6 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
             {requests.map((req) => (
               <div key={req.requestId} className="rounded-xl border border-slate-700 bg-slate-900/60 p-4">
                 <div className="flex flex-wrap items-center gap-2">
-                  {req.patientSpec && <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1 text-xs font-semibold uppercase text-cyan-200">{req.patientSpec}</span>}
                   {req.escalatedFrom && <span className="rounded-full border border-orange-400/30 bg-orange-400/10 px-2.5 py-1 text-xs font-semibold text-orange-200">Rerouted from {req.escalatedFrom}</span>}
                   {req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Auto-Approved</span>}
                   <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${requestStatusClass(req.status)}`}>{req.status.charAt(0).toUpperCase() + req.status.slice(1)}</span>
@@ -754,7 +734,7 @@ function statusBadgeColor(status) {
 }
 
 function getNodeColor(utilization) {
-  if (utilization >= 0.9) return "#ef4444";
+  if (utilization >= 0.97) return "#ef4444";
   if (utilization >= 0.5) return "#f59e0b";
   return "#34d399";
 }
