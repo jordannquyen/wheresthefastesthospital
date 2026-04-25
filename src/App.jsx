@@ -548,6 +548,9 @@ function App() {
                             {index === 0 && dispatch?.activeRequest?.autoApproved && (
                               <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2 py-0.5 text-xs font-semibold text-emerald-300">Auto-Accepted</span>
                             )}
+                            {index === 0 && dispatch?.activeRequest?.escalatedFrom && (
+                              <span className="rounded-full border border-orange-400/40 bg-orange-400/15 px-2 py-0.5 text-xs font-semibold text-orange-300">Rerouted from {dispatch.activeRequest.escalatedFrom}</span>
+                            )}
                           </p>
                           <p className="mt-1 text-xs text-slate-300">
                             {candidate.distanceMiles} mi | {candidate.availableBeds} beds avail | {Math.round(candidate.utilization * 100)}% util | {candidate.waitMins} min wait
