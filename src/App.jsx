@@ -18,7 +18,6 @@ const rankLabels = ["1", "2", "3"];
 
 function App() {
   const [nodes, setNodes] = useState([]);
-  const [telemetry, setTelemetry] = useState({});
   const [origin, setOrigin] = useState(null);
   const [route, setRoute] = useState(null);
   const [pulseTick, setPulseTick] = useState(false);
@@ -44,44 +43,45 @@ function App() {
   });
 
   useEffect(() => {
-    const pulseInterval = setInterval(() => setPulseTick((current) => !current), 900);
+    const pulseInterval = setInterval(() => setPulseTick((c) => !c), 900);
     return () => clearInterval(pulseInterval);
   }, []);
 
   useEffect(() => {
     if (activeTab !== "hospital") return;
-
     fetchHospitalRequests();
-    const interval = setInterval(fetchHospitalRequests, 3500);
-    return () => clearInterval(interval);
+    const iv = setInterval(fetchHospitalRequests, 3500);
+    return () => clearInterval(iv);
   }, [activeTab, selectedHospitalFilter]);
 
-  async function fetchNodes() {
-    const response = await fetch("/api/nodes");
-    const data = await response.json();
-    setNodes(data.nodes ?? []);
-  }
-
-  async function fetchTelemetry() {
-    // Only fetch if we have nodes (means we're in a geocoded area)
-    if (nodes.length === 0) {
-      return;
+  async function fetchHospitalsByCoords(lat, lng) {
+    try {
+      const res = await fetch("/api/hospitals-by-coords", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lat, lng }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setNodes(data.nodes ?? []);
+        setMapCenter({ lat, lng });
+        setMapZoom(10.5);
+      }
+    } catch (err) {
+      console.error(err);
+      setLocationError("Unable to fetch hospitals for this location");
     }
-
-    const response = await fetch("/api/telemetry");
-    const data = await response.json();
-    setTelemetry(data.nodes ?? {});
   }
 
   async function fetchHospitalRequests() {
     const params = selectedHospitalFilter ? `?hospitalId=${selectedHospitalFilter}` : "";
-    const response = await fetch(`/api/requests${params}`);
-    const data = await response.json();
+    const res = await fetch(`/api/requests${params}`);
+    const data = await res.json();
     setHospitalRequests(data.requests ?? []);
   }
 
   async function handleRequest(candidate) {
-    const response = await fetch("/api/requests", {
+    const res = await fetch("/api/requests", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -92,10 +92,8 @@ function App() {
         etaMins: candidate.durationMins,
       }),
     });
-    const data = await response.json();
-    if (response.ok) {
-      setSentRequests((prev) => ({ ...prev, [candidate.id]: data.requestId }));
-    }
+    const data = await res.json();
+    if (res.ok) setSentRequests((prev) => ({ ...prev, [candidate.id]: data.requestId }));
   }
 
   async function handleRequestAction(requestId, status) {
@@ -115,13 +113,14 @@ function App() {
     };
     setResolvedAddress("Map pin");
     setLocationError("");
+    await fetchHospitalsByCoords(clickOrigin.lat, clickOrigin.lng);
     await requestRecommendations(clickOrigin);
   }
 
   async function requestRecommendations(inputOrigin) {
     setOrigin(inputOrigin);
     setSentRequests({});
-    const response = await fetch("/api/route", {
+    const res = await fetch("/api/route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -130,86 +129,60 @@ function App() {
         insurance: insurance || null,
       }),
     });
-
-    const data = await response.json();
+    const data = await res.json();
     setRoute(data);
     setProvider(data.provider ?? "fallback");
-
     if (data.specification && !data.specificationMatchFound) {
-      setLocationError(`No ${data.specification.toUpperCase()} center match found, showing nearest-capacity fallback.`);
+      setLocationError(
+        `No ${data.specification.toUpperCase()} center match found, showing nearest-capacity fallback.`,
+      );
     }
   }
 
-  const selectedHospital = nodes.find((node) => node.id === selectedHospitalId) ?? null;
-  const selectedTelemetry = selectedHospital ? telemetry[selectedHospital.id] ?? null : null;
+  // Prefer enriched candidate from route (has distanceMiles, durationMins, waitMins, status)
+  const selectedHospital =
+    route?.candidates?.find((c) => c.id === selectedHospitalId) ??
+    nodes.find((n) => n.id === selectedHospitalId) ??
+    null;
+  const selectedStats = getHospitalStats(selectedHospital);
 
   const [addressInputRef, setAddressInputRef] = useState(null);
 
   async function handleLocationSubmit(event) {
     event.preventDefault();
-
-    // Get the actual value from the input element (in case of manual typing)
     const addressValue = addressInputRef?.value?.trim() || locationAddress.trim();
-
-    if (!addressValue) {
-      setLocationError("Enter an address to continue.");
-      return;
-    }
-
+    if (!addressValue) { setLocationError("Enter an address to continue."); return; }
     try {
       setLocationError("");
-      const geocodeResponse = await fetch("/api/geocode", {
+      const geoRes = await fetch("/api/geocode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ address: addressValue }),
       });
-
-      const geocodeData = await geocodeResponse.json();
-      if (!geocodeResponse.ok) {
-        setLocationError(geocodeData.error ?? "Unable to resolve address.");
-        return;
-      }
-
-      setLocationAddress(geocodeData.formattedAddress ?? addressValue);
-      setResolvedAddress(geocodeData.formattedAddress ?? addressValue);
-
-      // Fetch hospitals for this location
-      await fetchHospitalsByCoords(geocodeData.location.lat, geocodeData.location.lng);
-
-      // Then request recommendations
-      await requestRecommendations(geocodeData.location);
-    } catch (_error) {
+      const geoData = await geoRes.json();
+      if (!geoRes.ok) { setLocationError(geoData.error ?? "Unable to resolve address."); return; }
+      setLocationAddress(geoData.formattedAddress ?? addressValue);
+      setResolvedAddress(geoData.formattedAddress ?? addressValue);
+      await fetchHospitalsByCoords(geoData.location.lat, geoData.location.lng);
+      await requestRecommendations(geoData.location);
+    } catch (_) {
       setLocationError("Unable to geocode this address right now.");
     }
   }
 
   async function handlePlaceChanged() {
     if (!addressAutocomplete) return;
-
-    const first = addressAutocomplete.getPlace?.();
-    const location = first?.geometry?.location;
-
-    if (!location) return;
     const place = addressAutocomplete.getPlace?.();
-    if (!place || !place.geometry) {
-      return;
-    }
-
-    const location = place.geometry.location;
+    if (!place?.geometry) return;
+    const loc = place.geometry.location;
     const selectedOrigin = {
-      lat: Number(location.lat().toFixed(6)),
-      lng: Number(location.lng().toFixed(6)),
+      lat: Number(loc.lat().toFixed(6)),
+      lng: Number(loc.lng().toFixed(6)),
     };
-
-    const formattedAddress = place.formatted_address || place.name || "";
-    setLocationAddress(formattedAddress);
-    setResolvedAddress(formattedAddress);
+    setLocationAddress(place.formatted_address || place.name || "");
+    setResolvedAddress(place.formatted_address || place.name || "");
     setLocationError("");
-
-    // Fetch hospitals for this location
     await fetchHospitalsByCoords(selectedOrigin.lat, selectedOrigin.lng);
-
-    // Then request recommendations
     await requestRecommendations(selectedOrigin);
   }
 
@@ -217,16 +190,9 @@ function App() {
     return (
       <main className="screen bg-grid text-slate-100">
         <div className="mx-auto max-w-3xl rounded-2xl border border-cyan-400/40 bg-slate-900/90 p-8 shadow-2xl shadow-cyan-600/20">
-          <p className="font-mono text-xs uppercase tracking-[0.22em] text-cyan-300">
-            wtf-hospital
-          </p>
+          <p className="font-mono text-xs uppercase tracking-[0.22em] text-cyan-300">wtf-hospital</p>
           <h1 className="mt-2 text-3xl font-semibold">Google API key required</h1>
-          <p className="mt-3 text-slate-300">
-            Add GOOGLE_MAPS_API_KEY to your environment and restart the app to load the live Google Maps dashboard.
-          </p>
-          <p className="mt-3 text-sm text-slate-400">
-            Backend telemetry and cost routing are still active at /api/telemetry and /api/route.
-          </p>
+          <p className="mt-3 text-slate-300">Add GOOGLE_MAPS_API_KEY to your .env and restart.</p>
         </div>
       </main>
     );
@@ -240,51 +206,88 @@ function App() {
     <main className="screen bg-grid text-slate-100">
       <section className="mx-auto grid h-full w-full max-w-[1500px] grid-rows-[auto_auto_1fr] gap-4 p-4 lg:p-6">
         <header className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4 shadow-xl shadow-black/40 backdrop-blur">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
-            <div>
-              <h1 className="mt-1 text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
-              <p className="mt-2 text-sm text-slate-300 lg:text-base">a tool for emts to optimize saving lives</p>
-            </div>
-          </div>
+          <h1 className="text-3xl font-semibold tracking-tight lg:text-4xl">wtf-hospital</h1>
+          <p className="mt-1 text-sm text-slate-300">a tool for emts to optimize saving lives</p>
         </header>
 
-        <section className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[2fr_1fr]">
-          <article className="relative min-h-[420px] overflow-hidden rounded-2xl border border-slate-700 bg-slate-950/70 shadow-xl shadow-black/35">
-            {isLoaded && (
-              <GoogleMap
-                mapContainerStyle={mapContainerStyle}
-                center={mapCenter}
-                zoom={mapZoom}
-                options={mapOptions}
-                onClick={handleMapClick}
-              >
-                {nodes.map((node) => {
-                  const nodeTelemetry = telemetry[node.id] ?? {};
-                  const utilization = Number(nodeTelemetry.utilization ?? 0.2);
-                  const color = getNodeColor(utilization);
-                  const isCongested = utilization >= 0.9;
+        <nav className="flex gap-1 rounded-2xl border border-slate-700 bg-slate-950/70 p-1">
+          {["emt", "hospital"].map((tab) => (
+            <button
+              key={tab}
+              type="button"
+              onClick={() => setActiveTab(tab)}
+              className={`flex-1 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                activeTab === tab ? "bg-cyan-500 text-slate-950" : "text-slate-300 hover:bg-slate-800"
+              }`}
+            >
+              {tab === "emt" ? "EMT View" : "Hospital View"}
+            </button>
+          ))}
+        </nav>
 
-                  return (
-                    <Circle
-                      key={`circle-${node.id}`}
-                      center={{ lat: node.lat, lng: node.lng }}
-                      radius={isCongested ? (pulseTick ? 1550 : 1150) : 960}
+        {activeTab === "emt" && (
+          <section className="grid min-h-0 grid-cols-1 gap-4 lg:grid-cols-[2fr_1fr]">
+            <article className="relative min-h-[420px] overflow-hidden rounded-2xl border border-slate-700 bg-slate-950/70 shadow-xl shadow-black/35">
+              {isLoaded && (
+                <GoogleMap
+                  mapContainerStyle={mapContainerStyle}
+                  center={mapCenter}
+                  zoom={mapZoom}
+                  options={mapOptions}
+                  onClick={handleMapClick}
+                >
+                  {nodes.map((node) => {
+                    const util = nodeUtilization(node);
+                    const color = getNodeColor(util);
+                    const congested = util >= 0.9;
+                    return (
+                      <Circle
+                        key={`circle-${node.id}`}
+                        center={{ lat: node.lat, lng: node.lng }}
+                        radius={congested ? (pulseTick ? 1550 : 1150) : 960}
+                        options={{
+                          fillColor: color,
+                          fillOpacity: congested ? 0.46 : 0.26,
+                          strokeColor: color,
+                          strokeOpacity: 0.85,
+                          strokeWeight: congested ? 2.5 : 1.4,
+                          clickable: true,
+                        }}
+                        onClick={() => setSelectedHospitalId(node.id)}
+                      />
+                    );
+                  })}
+
+                  {nodes.map((node) => {
+                    const util = nodeUtilization(node);
+                    return (
+                      <MarkerF
+                        key={`marker-${node.id}`}
+                        position={{ lat: node.lat, lng: node.lng }}
+                        title={`${node.name} (${Math.round(util * 100)}% utilized)`}
+                        onClick={() => setSelectedHospitalId(node.id)}
+                        icon={{
+                          path: window.google.maps.SymbolPath.CIRCLE,
+                          scale: util >= 0.9 && pulseTick ? 10 : 8,
+                          fillColor: getNodeColor(util),
+                          fillOpacity: 1,
+                          strokeColor: "#e2e8f0",
+                          strokeWeight: 1.2,
+                        }}
+                      />
+                    );
+                  })}
+
+                  {origin && <MarkerF position={origin} title="Patient Origin" />}
+
+                  {origin && route?.closest && (
+                    <Polyline
+                      path={[origin, { lat: route.closest.lat, lng: route.closest.lng }]}
                       options={{
                         strokeColor: "#94a3b8",
                         strokeOpacity: 0,
                         strokeWeight: 2,
-                        icons: [
-                          {
-                            icon: {
-                              path: "M 0,-1 0,1",
-                              strokeOpacity: 1,
-                              scale: 4,
-                              strokeColor: "#94a3b8",
-                            },
-                            offset: "0",
-                            repeat: "14px",
-                          },
-                        ],
+                        icons: [{ icon: { path: "M 0,-1 0,1", strokeOpacity: 1, scale: 4, strokeColor: "#94a3b8" }, offset: "0", repeat: "14px" }],
                       }}
                     />
                   )}
@@ -292,23 +295,15 @@ function App() {
                   {origin && route?.recommended && (
                     <Polyline
                       path={[origin, { lat: route.recommended.lat, lng: route.recommended.lng }]}
-                      options={{
-                        strokeColor: "#38bdf8",
-                        strokeOpacity: 0.95,
-                        strokeWeight: 4,
-                      }}
+                      options={{ strokeColor: "#38bdf8", strokeOpacity: 0.95, strokeWeight: 4 }}
                     />
                   )}
 
-                  {origin && (route?.top3 ?? []).slice(1).map((candidate) => (
+                  {origin && (route?.top3 ?? []).slice(1).map((c) => (
                     <Polyline
-                      key={`alt-${candidate.id}`}
-                      path={[origin, { lat: candidate.lat, lng: candidate.lng }]}
-                      options={{
-                        strokeColor: "#22d3ee",
-                        strokeOpacity: 0.6,
-                        strokeWeight: 2,
-                      }}
+                      key={`alt-${c.id}`}
+                      path={[origin, { lat: c.lat, lng: c.lng }]}
+                      options={{ strokeColor: "#22d3ee", strokeOpacity: 0.6, strokeWeight: 2 }}
                     />
                   ))}
 
@@ -317,26 +312,31 @@ function App() {
                       position={{ lat: selectedHospital.lat, lng: selectedHospital.lng }}
                       onCloseClick={() => setSelectedHospitalId(null)}
                     >
-                      <div className="min-w-[220px] p-1 text-slate-900">
+                      <div className="min-w-[200px] p-1 text-slate-900">
                         <p className="text-sm font-semibold">{selectedHospital.name}</p>
-                        <p className="text-xs">Specialty: {selectedHospital.specialty}</p>
-                        <p className="text-xs">Utilization: {Math.round(Number(selectedTelemetry?.utilization ?? 0) * 100)}%</p>
-                        <p className="text-xs">Capacity (beds): {selectedTelemetry?.availableBeds ?? "--"}</p>
-                        <p className="text-xs">Wait: {selectedTelemetry?.waitMins ?? "--"} min</p>
+                        <p className="text-xs">{selectedHospital.address}, {selectedHospital.city}</p>
+                        {selectedHospital.status && <p className="text-xs font-semibold">Status: {selectedHospital.status}</p>}
+                        <p className="mt-1 text-xs">Inpatient util: {Math.round(selectedStats.utilization * 100)}%</p>
+                        <p className="text-xs">Available beds: {selectedStats.availableBeds}</p>
+                        <p className="text-xs">ICU util: {selectedStats.icuUtilization}%</p>
+                        <p className="text-xs">Est. wait: {selectedStats.waitMins} min</p>
+                        {selectedHospital.distanceMiles != null && (
+                          <p className="text-xs">Drive: {selectedHospital.distanceMiles} mi / {selectedHospital.durationMins} min</p>
+                        )}
                       </div>
                     </InfoWindowF>
                   )}
                 </GoogleMap>
               )}
 
-              <div className="pointer-events-none absolute bottom-3 right-3 max-w-[260px] rounded-xl border border-slate-600/90 bg-slate-950/85 p-3 backdrop-blur">
+              <div className="pointer-events-none absolute bottom-3 right-3 max-w-[240px] rounded-xl border border-slate-600/90 bg-slate-950/85 p-3 backdrop-blur">
                 <p className="text-xs font-semibold uppercase tracking-wide text-slate-200">Legend</p>
                 <ul className="mt-2 space-y-1.5 text-xs text-slate-300">
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-emerald-400"></span>Green: &lt;50% utilization</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400"></span>Yellow: 50%-89% utilization</li>
-                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500"></span>Red pulse: 90%+ utilization</li>
-                  <li><span className="mr-2 inline-block h-[2px] w-6 bg-sky-400 align-middle"></span>Top recommendation</li>
-                  <li><span className="mr-2 inline-block h-[2px] w-6 border-b border-dashed border-slate-400 align-middle"></span>Closest baseline</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" />Green: &lt;50% util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-amber-400" />Yellow: 50-89% util</li>
+                  <li><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full bg-red-500" />Red pulse: 90%+ util</li>
+                  <li><span className="mr-2 inline-block h-[2px] w-6 bg-sky-400 align-middle" />Top recommendation</li>
+                  <li><span className="mr-2 inline-block h-[2px] w-6 border-b border-dashed border-slate-400 align-middle" />Closest baseline</li>
                 </ul>
               </div>
             </article>
@@ -344,49 +344,38 @@ function App() {
             <aside className="grid min-h-0 grid-rows-[auto_auto_1fr] gap-4">
               <section className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                 <h2 className="text-lg font-semibold">Current Location</h2>
-                <p className="mt-1 text-sm text-slate-300">Use address autofill or click the map, then compute top 3 hospitals by distance and capacity.</p>
+                <p className="mt-1 text-sm text-slate-300">Use address autofill or click the map, then compute top 3 hospitals.</p>
                 <form className="mt-3 grid grid-cols-1 gap-2" onSubmit={handleLocationSubmit}>
                   {isLoaded ? (
                     <Autocomplete
-                      onLoad={(autocomplete) => setAddressAutocomplete(autocomplete)}
+                      onLoad={(ac) => setAddressAutocomplete(ac)}
                       onPlacesChanged={handlePlaceChanged}
-                      options={{
-                        fields: ["formatted_address", "geometry", "name"],
-                        componentRestrictions: { country: "us" },
-                      }}
+                      options={{ fields: ["formatted_address", "geometry", "name"], componentRestrictions: { country: "us" } }}
                     >
                       <input
+                        ref={setAddressInputRef}
                         type="text"
-                        value={locationAddress}
-                        onChange={(event) => setLocationAddress(event.target.value)}
-                        className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
-                        placeholder="Start typing an address in Los Angeles"
+                        onChange={(e) => setLocationAddress(e.target.value)}
+                        className="w-full rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
+                        placeholder="Start typing an address"
                       />
                     </Autocomplete>
                   ) : (
                     <input
-                      ref={setAddressInputRef}
                       type="text"
-                      onChange={(event) => setLocationAddress(event.target.value)}
+                      value={locationAddress}
+                      onChange={(e) => setLocationAddress(e.target.value)}
                       className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
-                      placeholder="Start typing an address"
+                      placeholder="Loading autocomplete..."
                     />
                   )}
-                  <select
-                    value={specification}
-                    onChange={(event) => setSpecification(event.target.value)}
-                    className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
-                  >
+                  <select value={specification} onChange={(e) => setSpecification(e.target.value)} className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
                     <option value="">Specification (optional)</option>
                     <option value="stemi">STEMI</option>
                     <option value="stroke">Stroke</option>
                     <option value="trauma">Trauma</option>
                   </select>
-                  <select
-                    value={insurance}
-                    onChange={(event) => setInsurance(event.target.value)}
-                    className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm"
-                  >
+                  <select value={insurance} onChange={(e) => setInsurance(e.target.value)} className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm">
                     <option value="">Insurance (optional)</option>
                     <option value="Medicare">Medicare</option>
                     <option value="Medicaid">Medicaid</option>
@@ -396,19 +385,12 @@ function App() {
                     <option value="Cigna">Cigna</option>
                     <option value="Kaiser">Kaiser</option>
                   </select>
-                  <button
-                    type="submit"
-                    className="rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
-                  >
+                  <button type="submit" className="rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400">
                     Get Top 3 Hospitals
                   </button>
                 </form>
-                {resolvedAddress && (
-                  <p className="mt-2 text-xs text-cyan-300">Resolved: {resolvedAddress}</p>
-                )}
-                {locationError && (
-                  <p className="mt-2 text-xs text-red-300">{locationError}</p>
-                )}
+                {resolvedAddress && <p className="mt-2 text-xs text-cyan-300">Resolved: {resolvedAddress}</p>}
+                {locationError && <p className="mt-2 text-xs text-red-300">{locationError}</p>}
               </section>
 
               {selectedHospital && (
@@ -416,23 +398,29 @@ function App() {
                   <h2 className="text-lg font-semibold">Selected Hospital</h2>
                   <div className="mt-2 space-y-1.5 text-sm text-slate-200">
                     <p className="font-semibold text-slate-100">{selectedHospital.name}</p>
-                    <p>Specialty: {selectedHospital.specialty}</p>
-                    <p>Center Types: {formatCenterTypes(selectedHospital.centerTypes)}</p>
-                    <p>Insurance: {selectedHospital.acceptedInsurance?.join(", ") || "Not available"}</p>
-                    <p>Utilization: {Math.round(Number(selectedTelemetry?.utilization ?? 0) * 100)}%</p>
-                    <p>Available Beds: {selectedTelemetry?.availableBeds ?? "--"}</p>
-                    <p>Current Wait: {selectedTelemetry?.waitMins ?? "--"} min</p>
-                    <p>Distance from selected location: {route ? `${route.candidates.find((candidate) => candidate.id === selectedHospital.id)?.distanceMiles ?? "--"} mi` : "--"}</p>
-                    <p>Routing status: {route?.recommended?.id === selectedHospital.id ? "Recommended" : route?.closest?.id === selectedHospital.id ? "Closest (baseline)" : "Alternative"}</p>
+                    <p className="text-slate-400">{selectedHospital.address}, {selectedHospital.city}, {selectedHospital.state} {selectedHospital.zip}</p>
+                    {selectedHospital.status && (
+                      <p>Status: <span className={selectedHospital.status === "Open" ? "text-emerald-300" : selectedHospital.status === "Saturation" ? "text-amber-300" : "text-red-300"}>{selectedHospital.status}</span></p>
+                    )}
+                    <p>Inpatient util: {Math.round(selectedStats.utilization * 100)}%</p>
+                    <p>Inpatient beds: {selectedStats.availableBeds} avail / {selectedHospital.beds?.inpatient_total} total</p>
+                    <p>ICU util: {selectedStats.icuUtilization}%</p>
+                    <p>ICU beds: {selectedStats.icuAvailable} avail / {selectedHospital.beds?.icu_total} total</p>
+                    <p>Est. wait: {selectedStats.waitMins} min</p>
+                    {selectedHospital.distanceMiles != null && (
+                      <p>Distance: {selectedHospital.distanceMiles} mi ({selectedHospital.durationMins} min drive)</p>
+                    )}
+                    <p>Routing: {route?.recommended?.id === selectedHospital.id ? "Recommended" : route?.closest?.id === selectedHospital.id ? "Closest (baseline)" : "Alternative"}</p>
+                    {selectedHospital.collectionDate && (
+                      <p className="text-xs text-slate-400">Data as of: {new Date(selectedHospital.collectionDate).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}</p>
+                    )}
                   </div>
                 </section>
               )}
 
               <section className="min-h-0 overflow-auto rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
                 <h2 className="text-lg font-semibold">Top 3 Hospital Choices</h2>
-                {!route && (
-                  <p className="mt-2 text-sm text-slate-300">Enter a current location to get ranked recommendations.</p>
-                )}
+                {!route && <p className="mt-2 text-sm text-slate-300">Enter a location to get ranked recommendations.</p>}
                 {route && (
                   <div className="mt-2 space-y-3 text-sm">
                     <p className="rounded-lg border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
@@ -440,12 +428,10 @@ function App() {
                     </p>
                     {route.specification && (
                       <p className="rounded-lg border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
-                        Specification: <span className="font-mono text-cyan-300">{route.specification.toUpperCase()}</span>
+                        Spec: <span className="font-mono text-cyan-300">{route.specification.toUpperCase()}</span>
                       </p>
                     )}
-                    <p>
-                      Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)
-                    </p>
+                    <p>Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)</p>
                     <div className="space-y-2 pt-1">
                       {(route.top3 || []).map((candidate, index) => (
                         <div key={candidate.id} className="rounded-lg border border-slate-700 bg-slate-900/60 p-2">
@@ -454,17 +440,13 @@ function App() {
                             {candidate.name}
                           </p>
                           <p className="mt-1 text-xs text-slate-300">
-                            Distance {candidate.distanceMiles} mi | Capacity {candidate.availableBeds} beds | Util {Math.round(candidate.utilization * 100)}% | Wait {candidate.waitMins} min
+                            {candidate.distanceMiles} mi | {candidate.availableBeds} beds avail | {Math.round(candidate.utilization * 100)}% util | {candidate.waitMins} min wait
                           </p>
                           <button
                             type="button"
                             onClick={() => handleRequest(candidate)}
                             disabled={!!sentRequests[candidate.id]}
-                            className={`mt-2 w-full rounded-lg px-3 py-1.5 text-xs font-semibold transition ${
-                              sentRequests[candidate.id]
-                                ? "cursor-not-allowed bg-slate-700 text-slate-400"
-                                : "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30"
-                            }`}
+                            className={`mt-2 w-full rounded-lg px-3 py-1.5 text-xs font-semibold transition ${sentRequests[candidate.id] ? "cursor-not-allowed bg-slate-700 text-slate-400" : "border border-cyan-500/40 bg-cyan-500/20 text-cyan-300 hover:bg-cyan-500/30"}`}
                           >
                             {sentRequests[candidate.id] ? "Requested ✓" : "Notify Hospital"}
                           </button>
@@ -501,18 +483,11 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
           <h2 className="text-lg font-semibold">Incoming Patient Requests</h2>
           <p className="mt-1 text-sm text-slate-300">EMT notifications routed to this hospital. Auto-approved when capacity is healthy.</p>
         </div>
-        <select
-          value={selectedHospitalFilter}
-          onChange={(e) => onFilterChange(e.target.value)}
-          className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-100"
-        >
+        <select value={selectedHospitalFilter} onChange={(e) => onFilterChange(e.target.value)} className="rounded-lg border border-slate-600 bg-slate-900 px-3 py-2 text-sm text-slate-100">
           <option value="">All hospitals</option>
-          {nodes.map((node) => (
-            <option key={node.id} value={node.id}>{node.name}</option>
-          ))}
+          {nodes.map((n) => <option key={n.id} value={n.id}>{n.name}</option>)}
         </select>
       </div>
-
       <div className="min-h-0 overflow-auto">
         {requests.length === 0 ? (
           <div className="flex h-full items-center justify-center rounded-2xl border border-slate-700 bg-slate-950/70">
@@ -521,49 +496,22 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {requests.map((req) => (
-              <div
-                key={req.requestId}
-                className="rounded-[28px] border border-slate-700 bg-slate-900/60 p-4"
-              >
+              <div key={req.requestId} className="rounded-[28px] border border-slate-700 bg-slate-900/60 p-4">
                 <div className="flex flex-wrap items-center gap-2">
-                  {req.patientSpec && (
-                    <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1 text-xs font-semibold uppercase text-cyan-200">
-                      {req.patientSpec}
-                    </span>
-                  )}
-                  {req.autoApproved && (
-                    <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">
-                      Auto-Approved
-                    </span>
-                  )}
-                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${requestStatusClass(req.status)}`}>
-                    {req.status.charAt(0).toUpperCase() + req.status.slice(1)}
-                  </span>
+                  {req.patientSpec && <span className="rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2.5 py-1 text-xs font-semibold uppercase text-cyan-200">{req.patientSpec}</span>}
+                  {req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Auto-Approved</span>}
+                  <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${requestStatusClass(req.status)}`}>{req.status.charAt(0).toUpperCase() + req.status.slice(1)}</span>
                 </div>
-
                 <p className="mt-3 font-semibold text-slate-100">{req.hospitalName}</p>
                 <div className="mt-2 space-y-1 text-sm text-slate-300">
                   <p>ETA: <span className="text-slate-100">{req.etaMins != null ? `${req.etaMins} min` : "--"}</span></p>
                   {req.insurance && <p>Insurance: <span className="text-slate-100">{req.insurance}</span></p>}
                   <p className="font-mono text-xs text-slate-500">{new Date(req.requestedAt).toLocaleTimeString()}</p>
                 </div>
-
                 {req.status === "pending" && (
                   <div className="mt-4 flex gap-2">
-                    <button
-                      type="button"
-                      onClick={() => onAccept(req.requestId)}
-                      className="flex-1 rounded-xl bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30"
-                    >
-                      Accept
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => onDivert(req.requestId)}
-                      className="flex-1 rounded-xl bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/30"
-                    >
-                      Divert
-                    </button>
+                    <button type="button" onClick={() => onAccept(req.requestId)} className="flex-1 rounded-xl bg-emerald-500/20 px-3 py-2 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/30">Accept</button>
+                    <button type="button" onClick={() => onDivert(req.requestId)} className="flex-1 rounded-xl bg-red-500/20 px-3 py-2 text-xs font-semibold text-red-200 transition hover:bg-red-500/30">Divert</button>
                   </div>
                 )}
               </div>
@@ -575,23 +523,32 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
   );
 }
 
+function nodeUtilization(node) {
+  return node.beds?.inpatient_utilization != null ? node.beds.inpatient_utilization / 100 : 0.2;
+}
+
+function getHospitalStats(hospital) {
+  if (!hospital) return { utilization: 0, availableBeds: "--", icuUtilization: "--", icuAvailable: "--", waitMins: "--" };
+  const b = hospital.beds ?? {};
+  return {
+    utilization: hospital.utilization ?? (b.inpatient_utilization != null ? b.inpatient_utilization / 100 : 0),
+    availableBeds: hospital.availableBeds ?? Math.round((b.inpatient_total ?? 0) - (b.inpatient_used ?? 0)),
+    icuUtilization: b.icu_utilization ?? "--",
+    icuAvailable: Math.round((b.icu_total ?? 0) - (b.icu_used ?? 0)),
+    waitMins: hospital.waitMins ?? Math.round(10 + (b.inpatient_utilization ?? 0) * 0.5),
+  };
+}
+
 function requestStatusClass(status) {
-  switch (status) {
-    case "accepted": return "border border-emerald-500/30 bg-emerald-500/10 text-emerald-200";
-    case "diverted": return "border border-red-500/30 bg-red-500/10 text-red-200";
-    default: return "border border-amber-500/30 bg-amber-500/10 text-amber-200";
-  }
+  if (status === "accepted") return "border border-emerald-500/30 bg-emerald-500/10 text-emerald-200";
+  if (status === "diverted") return "border border-red-500/30 bg-red-500/10 text-red-200";
+  return "border border-amber-500/30 bg-amber-500/10 text-amber-200";
 }
 
 function getNodeColor(utilization) {
   if (utilization >= 0.9) return "#ef4444";
   if (utilization >= 0.5) return "#f59e0b";
   return "#34d399";
-}
-
-function formatCenterTypes(centerTypes = []) {
-  if (centerTypes.length === 0) return "General";
-  return centerTypes.map((type) => type.toUpperCase()).join(", ");
 }
 
 const mapOptions = {
