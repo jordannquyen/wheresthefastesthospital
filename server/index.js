@@ -1,7 +1,10 @@
+import { Readable } from "node:stream";
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import multer from "multer";
 import { Client } from "@googlemaps/google-maps-services-js";
+import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import { getNodes, getTelemetry, jitterTelemetry } from "./telemetry.js";
 
 dotenv.config();
@@ -10,12 +13,25 @@ const app = express();
 const googleMapsClient = new Client({});
 const port = Number(process.env.PORT || 8787);
 const googleMapsApiKey = process.env.GOOGLE_MAPS_API_KEY;
+const elevenLabsApiKey = process.env.ELEVENLABS_API_KEY;
+const elevenlabs = elevenLabsApiKey
+  ? new ElevenLabsClient({ apiKey: elevenLabsApiKey })
+  : null;
+const uploadAudio = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 20 * 1024 * 1024 },
+});
+const defaultVoiceId = process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
 
 app.use(cors());
 app.use(express.json());
 
 app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, provider: googleMapsApiKey ? "google" : "fallback" });
+  res.json({
+    ok: true,
+    provider: googleMapsApiKey ? "google" : "fallback",
+    voice: Boolean(elevenlabs),
+  });
 });
 
 app.get("/api/nodes", (_req, res) => {
@@ -77,6 +93,61 @@ app.post("/api/route", async (req, res) => {
   } catch (error) {
     console.error("Routing error", error);
     res.status(500).json({ error: "Failed to compute route" });
+  }
+});
+
+app.post("/api/stt", uploadAudio.single("audio"), async (req, res) => {
+  if (!elevenlabs) {
+    return res.status(503).json({ error: "ELEVENLABS_API_KEY not configured" });
+  }
+  if (!req.file) {
+    return res.status(400).json({ error: "audio file is required" });
+  }
+
+  try {
+    const audioBlob = new Blob([req.file.buffer], {
+      type: req.file.mimetype || "audio/webm",
+    });
+    const result = await elevenlabs.speechToText.convert({
+      file: audioBlob,
+      modelId: "scribe_v2",
+      languageCode: "eng",
+      tagAudioEvents: false,
+    });
+    return res.json({ transcript: result.text ?? "" });
+  } catch (error) {
+    console.error("STT error", error);
+    return res.status(500).json({ error: "Failed to transcribe audio" });
+  }
+});
+
+app.post("/api/tts", async (req, res) => {
+  if (!elevenlabs) {
+    return res.status(503).json({ error: "ELEVENLABS_API_KEY not configured" });
+  }
+
+  const { text, voiceId } = req.body ?? {};
+  if (!text || typeof text !== "string") {
+    return res.status(400).json({ error: "text is required" });
+  }
+
+  try {
+    const audioStream = await elevenlabs.textToSpeech.stream(voiceId || defaultVoiceId, {
+      text,
+      modelId: "eleven_flash_v2_5",
+      outputFormat: "mp3_44100_128",
+    });
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    Readable.fromWeb(audioStream).pipe(res);
+  } catch (error) {
+    console.error("TTS error", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to synthesize speech" });
+    } else {
+      res.end();
+    }
   }
 });
 

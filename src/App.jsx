@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Circle,
   Autocomplete,
@@ -8,6 +8,8 @@ import {
   Polyline,
   useJsApiLoader,
 } from "@react-google-maps/api";
+import { useVoice } from "./hooks/useVoice.js";
+import { extractPatient } from "./lib/extractPatient.js";
 
 const centerLA = { lat: 34.0522, lng: -118.2437 };
 const defaultZoom = 10.5;
@@ -30,6 +32,21 @@ function App() {
   const [specification, setSpecification] = useState("");
   const [insurance, setInsurance] = useState("");
   const [addressAutocomplete, setAddressAutocomplete] = useState(null);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [patientSummary, setPatientSummary] = useState(null);
+  const voice = useVoice();
+  const originRef = useRef(origin);
+
+  useEffect(() => {
+    originRef.current = origin;
+  }, [origin]);
+
+  useEffect(() => {
+    fetch("/api/health")
+      .then((response) => response.json())
+      .then((data) => setVoiceEnabled(Boolean(data?.voice)))
+      .catch(() => setVoiceEnabled(false));
+  }, []);
 
   const { isLoaded, loadError } = useJsApiLoader({
     id: "google-map-script",
@@ -77,15 +94,44 @@ function App() {
     await requestRecommendations(clickOrigin);
   }
 
-  async function requestRecommendations(inputOrigin) {
+  async function handleTalkToggle() {
+    if (voice.isListening) {
+      const transcript = await voice.stop();
+      if (!transcript) {
+        if (voice.error) {
+          await voice.speak("Sorry, I didn't catch that. Try again.");
+        }
+        return;
+      }
+
+      const summary = extractPatient(transcript);
+      setPatientSummary(summary);
+      if (summary.specification) {
+        setSpecification(summary.specification);
+      }
+
+      const reply = buildVoiceReply(summary, originRef.current);
+      voice.speak(reply);
+
+      if (originRef.current && summary.specification) {
+        await requestRecommendations(originRef.current, summary.specification);
+      }
+    } else {
+      setPatientSummary(null);
+      await voice.start();
+    }
+  }
+
+  async function requestRecommendations(inputOrigin, overrideSpecification) {
     setOrigin(inputOrigin);
+    const effectiveSpecification = overrideSpecification ?? specification;
     const response = await fetch("/api/route", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ 
-        origin: inputOrigin, 
-        specification: specification || null,
-        insurance: insurance || null
+      body: JSON.stringify({
+        origin: inputOrigin,
+        specification: effectiveSpecification || null,
+        insurance: insurance || null,
       }),
     });
 
@@ -324,7 +370,62 @@ function App() {
             </div>
           </article>
 
-          <aside className="grid min-h-0 grid-rows-[auto_auto_1fr] gap-4">
+          <aside className="grid min-h-0 grid-rows-[auto_auto_auto_1fr] gap-4">
+            <section className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-lg font-semibold">Voice Intake</h2>
+                <span className={`font-mono text-[10px] uppercase tracking-[0.2em] ${voiceEnabled ? "text-emerald-300" : "text-slate-500"}`}>
+                  {voiceEnabled ? "ElevenLabs ready" : "voice offline"}
+                </span>
+              </div>
+              <p className="mt-1 text-sm text-slate-300">
+                Tap the mic, describe the patient, then tap again to stop. Condition and vitals are extracted automatically.
+              </p>
+              <button
+                type="button"
+                onClick={handleTalkToggle}
+                disabled={!voiceEnabled || voice.isProcessing}
+                className={`mt-3 flex w-full items-center justify-center gap-2 rounded-lg px-3 py-3 text-sm font-semibold transition ${
+                  voice.isListening
+                    ? "bg-red-500 text-white hover:bg-red-400"
+                    : "bg-cyan-500 text-slate-950 hover:bg-cyan-400"
+                } ${(!voiceEnabled || voice.isProcessing) ? "cursor-not-allowed opacity-60" : ""}`}
+              >
+                <span className={`inline-block h-2.5 w-2.5 rounded-full ${voice.isListening ? "animate-pulse bg-white" : "bg-slate-950/60"}`}></span>
+                {voice.isListening
+                  ? "Listening — tap to stop"
+                  : voice.isProcessing
+                    ? "Transcribing…"
+                    : voice.isSpeaking
+                      ? "Speaking…"
+                      : "Tap to talk"}
+              </button>
+              {voice.error && (
+                <p className="mt-2 text-xs text-red-300">{voice.error}</p>
+              )}
+              {patientSummary && (
+                <div className="mt-3 space-y-1.5 rounded-lg border border-slate-700 bg-slate-900/60 p-3 text-xs text-slate-200">
+                  <p className="font-mono uppercase tracking-wide text-cyan-300">Patient summary</p>
+                  {patientSummary.specification && (
+                    <p>Suspected: <span className="font-semibold text-white">{patientSummary.specification.toUpperCase()}</span></p>
+                  )}
+                  {(patientSummary.age || patientSummary.sex) && (
+                    <p>Demographics: {[patientSummary.age && `${patientSummary.age}y`, patientSummary.sex].filter(Boolean).join(", ")}</p>
+                  )}
+                  {(patientSummary.vitals.bp || patientSummary.vitals.hr || patientSummary.vitals.spo2) && (
+                    <p>Vitals: {[
+                      patientSummary.vitals.bp && `BP ${patientSummary.vitals.bp}`,
+                      patientSummary.vitals.hr && `HR ${patientSummary.vitals.hr}`,
+                      patientSummary.vitals.spo2 && `SpO₂ ${patientSummary.vitals.spo2}%`,
+                    ].filter(Boolean).join(" · ")}</p>
+                  )}
+                  {patientSummary.transcript && (
+                    <p className="mt-1 text-slate-400">"{patientSummary.transcript}"</p>
+                  )}
+                </div>
+              )}
+            </section>
+
             <section className="rounded-2xl border border-slate-700 bg-slate-950/70 p-4">
               <h2 className="text-lg font-semibold">Current Location</h2>
               <p className="mt-1 text-sm text-slate-300">Use address autofill or click the map, then compute top 3 hospitals by distance and capacity.</p>
@@ -448,6 +549,27 @@ function App() {
       </section>
     </main>
   );
+}
+
+function buildVoiceReply(summary, hasOrigin) {
+  const specLabels = { stemi: "STEMI", stroke: "stroke", trauma: "trauma" };
+  const parts = [];
+
+  if (summary.specification) {
+    parts.push(`Heard ${specLabels[summary.specification]} symptoms.`);
+  } else {
+    parts.push("Got it.");
+  }
+
+  if (hasOrigin && summary.specification) {
+    parts.push(`Routing to the closest ${specLabels[summary.specification]}-capable hospital now.`);
+  } else if (!hasOrigin) {
+    parts.push("Set the patient's location to compute the route.");
+  } else {
+    parts.push("Tell me the suspected condition or set a location to start routing.");
+  }
+
+  return parts.join(" ");
 }
 
 function getNodeColor(utilization) {
