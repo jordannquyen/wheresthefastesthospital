@@ -111,9 +111,17 @@ function normalizePatientInput(body, { allowPartial = false } = {}) {
   return { value: next };
 }
 
+const ACRONYMS = new Set([
+  "LA", "UCLA", "USC", "UCSD", "UCSF", "UC", "ER", "ICU",
+  "VA", "US", "USA", "II", "III", "IV", "VI", "VII", "VIII", "IX", "XI",
+]);
+
 function toTitleCase(str) {
   if (!str) return str;
-  return str.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase());
+  return str.toLowerCase().replace(/\b\w+/g, (word) => {
+    const upper = word.toUpperCase();
+    return ACRONYMS.has(upper) ? upper : word.charAt(0).toUpperCase() + word.slice(1);
+  });
 }
 
 function deduplicateByLatestWeek(rawRecords) {
