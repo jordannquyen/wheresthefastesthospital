@@ -1016,30 +1016,6 @@ function AuthenticatedApp({ user }) {
                 )}
               </section>
 
-              {selectedHospital && (
-                <section className="rounded-xl border border-slate-700 bg-slate-950/70 p-4">
-                  <h2 className="text-lg font-semibold">Selected Hospital</h2>
-                  <div className="mt-2 space-y-1.5 text-sm text-slate-200">
-                    <p className="font-semibold text-slate-100">{selectedHospital.name}</p>
-                    <p className="text-slate-400">{selectedHospital.address}, {selectedHospital.city}, {selectedHospital.state} {selectedHospital.zip}</p>
-                    {selectedHospital.status && (
-                      <p>Status: <span className={selectedHospital.status === "Open" ? "text-emerald-300" : selectedHospital.status === "Saturation" ? "text-amber-300" : "text-red-300"}>{selectedHospital.status}</span></p>
-                    )}
-                    <p>Inpatient util: {Math.round(selectedStats.utilization * 100)}%</p>
-                    <p>Inpatient beds: {selectedStats.availableBeds} avail / {selectedHospital.beds?.inpatient_total} total</p>
-                    <p>ICU util: {selectedStats.icuUtilization}%</p>
-                    <p>ICU beds: {selectedStats.icuAvailable} avail / {selectedHospital.beds?.icu_total} total</p>
-                    <p>Est. wait: {selectedStats.waitMins} min</p>
-                    {selectedHospital.distanceMiles != null && (
-                      <p>Distance: {selectedHospital.distanceMiles} mi ({selectedHospital.durationMins} min drive)</p>
-                    )}
-                    <p>Routing: {route?.recommended?.id === selectedHospital.id ? "Recommended" : route?.closest?.id === selectedHospital.id ? "Closest (baseline)" : "Alternative"}</p>
-                    {selectedHospital.collectionDate && (
-                      <p className="text-xs text-slate-400">Data as of: {new Date(selectedHospital.collectionDate).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })}</p>
-                    )}
-                  </div>
-                </section>
-              )}
 
               <section className={`flex-1 min-h-0 overflow-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4 transition-opacity duration-500 ${handoffDone ? "opacity-30" : "opacity-100"}`}>
                 <h2 className="text-lg font-semibold">Top 3 Hospital Choices</h2>
