@@ -3,7 +3,6 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { randomUUID } from "node:crypto";
 import { Client } from "@googlemaps/google-maps-services-js";
-import { getNodes, getTelemetry, jitterTelemetry } from "./telemetry.js";
 
 dotenv.config();
 
@@ -17,16 +16,262 @@ const googleMapsApiKey = process.env.GOOGLE_MAPS_API_KEY;
 app.use(cors());
 app.use(express.json());
 
+// Keep only the most recent record per hospital_pk (Socrata returns multiple weeks)
+function deduplicateByLatestWeek(rawRecords) {
+  const seen = new Map();
+  for (const h of rawRecords) {
+    if (!seen.has(h.hospital_pk) || h.collection_week > seen.get(h.hospital_pk).collection_week) {
+      seen.set(h.hospital_pk, h);
+    }
+  }
+  return [...seen.values()];
+}
+
+// Helper function to fetch hospitals for the entire state and filter by distance
+async function fetchHospitalsByDistance(lat, lng, radiusMiles = 50) {
+  try {
+    // Fetch all CA hospitals, most recent week first
+    const socrataUrl = new URL("https://healthdata.gov/resource/anag-cw7u.json");
+    socrataUrl.searchParams.set("$limit", 1000);
+    socrataUrl.searchParams.set("state", "CA");
+    socrataUrl.searchParams.set("$order", "collection_week DESC");
+
+    const response = await fetch(socrataUrl.toString(), { timeout: 5000 });
+    if (!response.ok) throw new Error(`Socrata API returned ${response.status}`);
+
+    const raw = await response.json();
+    const hospitals = deduplicateByLatestWeek(raw.filter((h) => h.geocoded_hospital_address));
+
+    const mapped = hospitals
+      .map((h) => {
+        const coords = h.geocoded_hospital_address?.coordinates;
+        const inpatientUsed = parseFloat(h.inpatient_beds_used_7_day_avg) || 0;
+        const inpatientTotal = parseFloat(h.inpatient_beds_7_day_avg) || 1;
+        const icuUsed = parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0;
+        const icuTotal = parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 1;
+
+        const hospitalLat = coords ? coords[1] : null;
+        const hospitalLng = coords ? coords[0] : null;
+        const distance = hospitalLat && hospitalLng ? haversineMiles(lat, lng, hospitalLat, hospitalLng) : 999;
+
+        return {
+          id: h.hospital_pk,
+          name: h.hospital_name,
+          lat: hospitalLat,
+          lng: hospitalLng,
+          address: h.address,
+          city: h.city,
+          state: h.state,
+          zip: h.zip,
+          distance: Number(distance.toFixed(2)),
+          beds: {
+            inpatient_total: inpatientTotal,
+            inpatient_used: inpatientUsed,
+            inpatient_utilization: Math.round((inpatientUsed / inpatientTotal) * 100),
+            icu_total: icuTotal,
+            icu_used: icuUsed,
+            icu_utilization: Math.round((icuUsed / icuTotal) * 100),
+          },
+          collectionDate: h.collection_week,
+        };
+      });
+
+    // Filter by distance radius and sort by distance
+    return mapped
+      .filter((h) => h.distance <= radiusMiles)
+      .sort((a, b) => a.distance - b.distance);
+  } catch (error) {
+    console.error("Failed to fetch hospitals by distance:", error);
+    return [];
+  }
+}
+
+// Cache hospitals to avoid excessive API calls
+let cachedHospitals = [];
+let cacheTimestamp = 0;
+const CACHE_DURATION = 3600000; // 1 hour
+
+async function fetchAndCacheHospitals(city = "LOS ANGELES", state = "CA", limit = 150) {
+  const cacheKey = `${city}|${state}`;
+  const now = Date.now();
+  
+  // Return cache if still valid
+  if (cachedHospitals.length > 0 && now - cacheTimestamp < CACHE_DURATION) {
+    return cachedHospitals;
+  }
+
+  try {
+    const socrataUrl = new URL("https://healthdata.gov/resource/anag-cw7u.json");
+    socrataUrl.searchParams.set("$limit", limit);
+    socrataUrl.searchParams.set("state", state);
+    socrataUrl.searchParams.set("$where", `city='${city}'`);
+    socrataUrl.searchParams.set("$order", "collection_week DESC");
+
+    const response = await fetch(socrataUrl.toString(), { timeout: 5000 });
+    if (!response.ok) throw new Error(`Socrata API returned ${response.status}`);
+
+    const raw = await response.json();
+    const hospitals = deduplicateByLatestWeek(raw.filter((h) => h.geocoded_hospital_address));
+
+    cachedHospitals = hospitals
+      .map((h) => {
+        const coords = h.geocoded_hospital_address?.coordinates;
+        const inpatientUsed = parseFloat(h.inpatient_beds_used_7_day_avg) || 0;
+        const inpatientTotal = parseFloat(h.inpatient_beds_7_day_avg) || 1;
+        const icuUsed = parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0;
+        const icuTotal = parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 1;
+
+        return {
+          id: h.hospital_pk,
+          name: h.hospital_name,
+          lat: coords ? coords[1] : null,
+          lng: coords ? coords[0] : null,
+          address: h.address,
+          city: h.city,
+          state: h.state,
+          zip: h.zip,
+          beds: {
+            inpatient_total: inpatientTotal,
+            inpatient_used: inpatientUsed,
+            inpatient_utilization: Math.round((inpatientUsed / inpatientTotal) * 100),
+            icu_total: icuTotal,
+            icu_used: icuUsed,
+            icu_utilization: Math.round((icuUsed / icuTotal) * 100),
+          },
+          collectionDate: h.collection_week,
+        };
+      });
+
+    cacheTimestamp = now;
+    return cachedHospitals;
+  } catch (error) {
+    console.error("Failed to fetch hospitals from Socrata:", error);
+    return cachedHospitals; // Return stale cache on error
+  }
+}
+
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, provider: googleMapsApiKey ? "google" : "fallback" });
 });
 
-app.get("/api/nodes", (_req, res) => {
-  res.json({ nodes: getNodes() });
+app.get("/api/nodes", async (req, res) => {
+  const { city, state = "CA" } = req.query;
+  
+  // If no city/state provided, return empty (global view)
+  if (!city) {
+    res.json({ nodes: [] });
+    return;
+  }
+  
+  const hospitals = await fetchAndCacheHospitals(city.toUpperCase(), state);
+  res.json({ nodes: hospitals });
 });
 
-app.get("/api/telemetry", (_req, res) => {
-  res.json(getTelemetry());
+app.post("/api/hospitals-by-coords", async (req, res) => {
+  const { lat, lng } = req.body ?? {};
+  
+  if (typeof lat !== "number" || typeof lng !== "number") {
+    return res.status(400).json({ error: "lat and lng are required numbers" });
+  }
+
+  try {
+    const hospitals = await fetchHospitalsByDistance(lat, lng, 50);
+    res.json({ nodes: hospitals });
+  } catch (error) {
+    console.error("Error fetching hospitals by coords:", error);
+    res.status(500).json({ error: "Failed to fetch hospitals for location" });
+  }
+});
+
+app.get("/api/telemetry", async (req, res) => {
+  const { city, state = "CA" } = req.query;
+  
+  // If no city/state, return empty telemetry
+  if (!city) {
+    res.json({ updatedAt: new Date().toISOString(), nodes: {} });
+    return;
+  }
+  
+  const hospitals = await fetchAndCacheHospitals(city.toUpperCase(), state);
+  
+  // Generate telemetry from real bed utilization data
+  const telemetryNodes = Object.fromEntries(
+    hospitals.map((h) => [
+      h.id,
+      {
+        utilization: h.beds.inpatient_utilization / 100,
+        waitMins: Math.round(10 + h.beds.inpatient_utilization * 0.5),
+        availableBeds: Math.round(h.beds.inpatient_total - h.beds.inpatient_used),
+        updatedAt: new Date().toISOString(),
+      },
+    ])
+  );
+
+  res.json({ updatedAt: new Date().toISOString(), nodes: telemetryNodes });
+});
+
+app.get("/api/hospitals", async (req, res) => {
+  const { city, state = "CA", limit = 100 } = req.query;
+
+  try {
+    const socrataUrl = new URL("https://healthdata.gov/resource/anag-cw7u.json");
+    socrataUrl.searchParams.set("$limit", limit);
+    socrataUrl.searchParams.set("state", state);
+    
+    // City parameter is optional and matches in UPPERCASE
+    if (city) {
+      socrataUrl.searchParams.set("$where", `city='${city.toUpperCase()}'`);
+    }
+
+    const response = await fetch(socrataUrl.toString(), {
+      timeout: 5000,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Socrata API returned ${response.status}`);
+    }
+
+    const hospitals = await response.json();
+
+    // Transform and normalize the data for the frontend
+    const transformed = hospitals
+      .filter((h) => h.geocoded_hospital_address) // Only include hospitals with coordinates
+      .map((h) => {
+        const coords = h.geocoded_hospital_address?.coordinates;
+        return {
+          id: h.hospital_pk,
+          name: h.hospital_name,
+          address: h.address,
+          city: h.city,
+          state: h.state,
+          zip: h.zip,
+          location: coords
+            ? {
+                lat: coords[1], // GeoJSON is [lng, lat]
+                lng: coords[0],
+              }
+            : null,
+          beds: {
+            inpatient_total: parseFloat(h.inpatient_beds_7_day_avg) || 0,
+            inpatient_used: parseFloat(h.inpatient_beds_used_7_day_avg) || 0,
+            inpatient_utilization: h.inpatient_beds_used_7_day_avg && h.inpatient_beds_7_day_avg
+              ? Math.round((parseFloat(h.inpatient_beds_used_7_day_avg) / parseFloat(h.inpatient_beds_7_day_avg)) * 100)
+              : 0,
+            icu_total: parseFloat(h.total_staffed_adult_icu_beds_7_day_avg) || 0,
+            icu_used: parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) || 0,
+            icu_utilization: h.staffed_adult_icu_bed_occupancy_7_day_avg && h.total_staffed_adult_icu_beds_7_day_avg
+              ? Math.round((parseFloat(h.staffed_adult_icu_bed_occupancy_7_day_avg) / parseFloat(h.total_staffed_adult_icu_beds_7_day_avg)) * 100)
+              : 0,
+          },
+          collectionDate: h.collection_week,
+        };
+      });
+
+    res.json({ hospitals: transformed, count: transformed.length });
+  } catch (error) {
+    console.error("Socrata fetch error", error);
+    res.status(500).json({ error: "Failed to fetch hospital data" });
+  }
 });
 
 app.post("/api/geocode", async (req, res) => {
@@ -83,93 +328,50 @@ app.post("/api/route", async (req, res) => {
   }
 });
 
-app.post("/api/requests", (req, res) => {
-  const { hospitalId, hospitalName, patientSpec, insurance, etaMins } = req.body ?? {};
-  const knownIds = getNodes().map((n) => n.id);
-  if (!hospitalId || !knownIds.includes(hospitalId)) {
-    return res.status(400).json({ error: "valid hospitalId is required" });
-  }
-
-  const autoApproved = shouldAutoApprove(hospitalId);
-  const requestId = randomUUID();
-  requests[requestId] = {
-    requestId,
-    hospitalId,
-    hospitalName: hospitalName ?? hospitalId,
-    patientSpec: patientSpec ?? null,
-    insurance: insurance ?? null,
-    etaMins: etaMins ?? null,
-    status: autoApproved ? "accepted" : "pending",
-    autoApproved,
-    requestedAt: new Date().toISOString(),
-  };
-
-  return res.json({ requestId, status: requests[requestId].status, autoApproved });
-});
-
-app.get("/api/requests", (req, res) => {
-  const { hospitalId } = req.query;
-  let list = Object.values(requests);
-  if (hospitalId) {
-    list = list.filter((r) => r.hospitalId === hospitalId);
-  }
-  list.sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
-  res.json({ requests: list });
-});
-
-app.patch("/api/requests/:requestId", (req, res) => {
-  const { requestId } = req.params;
-  const { status } = req.body ?? {};
-  const record = requests[requestId];
-
-  if (!record) return res.status(404).json({ error: "request not found" });
-  if (record.status !== "pending") return res.status(409).json({ error: "request already resolved" });
-  if (status !== "accepted" && status !== "diverted") {
-    return res.status(400).json({ error: "status must be accepted or diverted" });
-  }
-
-  record.status = status;
-  return res.json({ ok: true, requestId, status });
-});
-
-setInterval(() => {
-  jitterTelemetry();
-}, 10_000);
-
 app.listen(port, () => {
-  console.log(`Vital-Route backend listening on http://localhost:${port}`);
+  console.log(`backend listening on http://localhost:${port}`);
 });
 
 async function computeRoute(origin, specification, insurance) {
-  const nodes = getNodes();
-  const telemetry = getTelemetry().nodes;
+  // Fetch hospitals for the input location
+  const allNodes = await fetchHospitalsByDistance(origin.lat, origin.lng, 50);
   const normalizedSpecification = normalizeSpecification(specification);
   const normalizedInsurance = normalizeInsurance(insurance);
+
+  // Google Distance Matrix allows max 25 destinations per request; nodes are pre-sorted by haversine
+  const nodes = allNodes.slice(0, 25);
 
   const trafficResults = await getTravelMetrics(origin, nodes);
 
   const scored = nodes.map((node, index) => {
-    const state = telemetry[node.id];
     const traffic = trafficResults[index];
-    const status = deriveStatus(state.utilization);
+    const availableBeds = Math.round(node.beds.inpatient_total - node.beds.inpatient_used);
+    const waitMins = Math.round(10 + (node.beds.inpatient_utilization * 0.5)); // Estimated wait based on utilization
+    const utilization = node.beds.inpatient_utilization / 100;
 
     return {
       ...node,
-      waitMins: state.waitMins,
-      utilization: state.utilization,
-      availableBeds: state.availableBeds,
+      waitMins,
+      utilization,
+      availableBeds,
       distanceMiles: traffic.distanceMiles,
       durationMins: traffic.durationMins,
       status,
     };
   });
 
-  const ranked = [...scored]
-    .map((node) => ({
-      ...node,
-      score: scoreHospital(node, normalizedSpecification),
-    }))
-    .sort((a, b) => b.score - a.score);
+  const ranked = [...scored].sort((a, b) => {
+    // Primary: sort by distance
+    if (a.distanceMiles !== b.distanceMiles) {
+      return a.distanceMiles - b.distanceMiles;
+    }
+    // Secondary: more available beds is better
+    if (a.availableBeds !== b.availableBeds) {
+      return b.availableBeds - a.availableBeds;
+    }
+    // Tertiary: lower wait time is better
+    return a.waitMins - b.waitMins;
+  });
 
   // Filter by clinical specification if provided
   let candidates = normalizedSpecification
