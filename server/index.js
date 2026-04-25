@@ -903,6 +903,7 @@ app.get("/api/dispatch/:dispatchId", (req, res) => {
     chain: chainWithStatus,
     insurance: dispatch.insurance,
     patientId: dispatch.patientId,
+    createdAt: dispatch.createdAt,
   });
 });
 
@@ -922,12 +923,24 @@ app.patch("/api/requests/:requestId", ah(async (req, res) => {
   const record = requests[requestId];
 
   if (!record) return res.status(404).json({ error: "request not found" });
+
+  // Allow delivered transition from accepted; block everything else on resolved requests
+  if (status === "delivered") {
+    if (record.status !== "accepted") return res.status(409).json({ error: "can only deliver an accepted request" });
+    record.status = "delivered";
+    record.deliveredAt = new Date().toISOString();
+    const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
+    if (dispatch) dispatch.status = "delivered";
+    return res.json({ ok: true, requestId, status: "delivered" });
+  }
+
   if (record.status !== "pending") return res.status(409).json({ error: "request already resolved" });
   if (status !== "accepted" && status !== "diverted") {
     return res.status(400).json({ error: "status must be accepted or diverted" });
   }
 
   record.status = status;
+  if (status === "accepted") record.acceptedAt = new Date().toISOString();
 
   if (escalationTimers[requestId]) {
     clearTimeout(escalationTimers[requestId]);
@@ -1102,6 +1115,7 @@ function createRequest(dispatch, chainIndex, escalatedFromName) {
     status: autoApproved ? "accepted" : "pending",
     autoApproved,
     requestedAt: new Date().toISOString(),
+    acceptedAt: autoApproved ? new Date().toISOString() : null,
   };
   if (!autoApproved) {
     escalationTimers[requestId] = setTimeout(() => escalateRequest(requestId), 60_000);

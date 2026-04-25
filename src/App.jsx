@@ -62,6 +62,7 @@ function App() {
   const [currentPatientId, setCurrentPatientId] = useState(null);
   const [editingLocation, setEditingLocation] = useState(false);
   const [locationDraft, setLocationDraft] = useState("");
+  const [handoffDone, setHandoffDone] = useState(false);
   const mapRef = useRef(null);
   const originRef = useRef(origin);
   const prevDispatchRef = useRef(null);
@@ -283,6 +284,24 @@ function App() {
       const pollData = await pollRes.json();
       if (pollRes.ok) setDispatch(pollData);
     }
+  }
+
+  async function handlePatientHandoff() {
+    if (dispatch?.activeRequest?.requestId) {
+      await fetch(`/api/requests/${dispatch.activeRequest.requestId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: "delivered" }),
+      });
+    }
+    setHandoffDone(true);
+    setTimeout(() => {
+      setHandoffDone(false);
+      setDispatch(null);
+      setRoute(null);
+      setPatientSummary(null);
+      setSentRequests({});
+    }, 1800);
   }
 
   async function handleRequestAction(request, status) {
@@ -821,7 +840,7 @@ function App() {
                 </section>
               )}
 
-              <section className="flex-1 min-h-0 overflow-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4">
+              <section className={`flex-1 min-h-0 overflow-auto rounded-xl border border-slate-700 bg-slate-950/70 p-4 transition-opacity duration-500 ${handoffDone ? "opacity-30" : "opacity-100"}`}>
                 <h2 className="text-lg font-semibold">Top 3 Hospital Choices</h2>
                 {!route && <p className="mt-2 text-sm text-slate-300">Click anywhere on the map, type an address, or tap the mic to start.</p>}
                 {route && (
@@ -885,10 +904,35 @@ function App() {
                           </>
                         )}
                         {dispatch.status === "accepted" && (
-                          <p className="font-semibold">Confirmed — heading to {dispatch.currentHospital?.hospitalName}</p>
+                          <>
+                            <p className={`font-semibold transition-opacity duration-500 ${handoffDone ? "opacity-0" : "opacity-100"}`}>
+                              Confirmed — en route to {dispatch.currentHospital?.hospitalName}
+                            </p>
+                            <button
+                              type="button"
+                              onClick={handlePatientHandoff}
+                              disabled={handoffDone}
+                              className={`mt-2 w-full rounded-md px-3 py-2 text-sm font-semibold transition-all duration-300 ${
+                                handoffDone
+                                  ? "scale-95 bg-emerald-400 text-slate-950 cursor-default"
+                                  : "bg-emerald-500 text-slate-950 hover:bg-emerald-400"
+                              }`}
+                            >
+                              {handoffDone ? "Done! ✓" : "Patient Handed Off"}
+                            </button>
+                          </>
                         )}
                         {dispatch.status === "exhausted" && (
-                          <p className="font-semibold">All hospitals diverted — contact dispatch</p>
+                          <>
+                            <p className="font-semibold">All hospitals diverted — contact dispatch</p>
+                            <button
+                              type="button"
+                              onClick={handlePatientHandoff}
+                              className="mt-2 w-full rounded-md bg-slate-600 px-3 py-2 text-xs font-semibold text-slate-100 transition hover:bg-slate-500"
+                            >
+                              Clear &amp; New Patient
+                            </button>
+                          </>
                         )}
                       </div>
                     )}
@@ -1049,6 +1093,20 @@ function AdminView({ hospitals, onOverride }) {
   );
 }
 
+function ElapsedTimer({ since }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [since]);
+  if (!since) return null;
+  const ms = Date.now() - new Date(since).getTime();
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const mm = Math.floor(s / 60);
+  const ss = String(s % 60).padStart(2, "0");
+  return <span className="font-mono text-sm font-semibold text-emerald-300">{mm}:{ss}</span>;
+}
+
 function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFilter, onFilterChange }) {
   const [reportReq, setReportReq] = useState(null);
   return (
@@ -1078,11 +1136,21 @@ function HospitalView({ nodes, requests, onAccept, onDivert, selectedHospitalFil
                   {req.status === "accepted" && !req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Accepted</span>}
                   {req.status === "diverted" && <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-200">Diverted</span>}
                   {req.status === "pending" && <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-200">Pending</span>}
+                  {req.status === "delivered" && <span className="rounded-full border border-cyan-500/30 bg-cyan-500/10 px-2.5 py-1 text-xs font-semibold text-cyan-200">Patient Arrived</span>}
                 </div>
                 <p className="mt-3 font-semibold text-slate-100">{req.hospitalName}</p>
                 <div className="mt-2 space-y-1 text-sm text-slate-300">
                   <p>ETA: <span className="text-slate-100">{req.etaMins != null ? `${req.etaMins} min` : "--"}</span></p>
                   {req.insurance && <p>Insurance: <span className="text-slate-100">{req.insurance}</span></p>}
+                  {(req.status === "accepted" || req.status === "delivered") && req.acceptedAt && (
+                    <div className="mt-2 flex items-center justify-between rounded-md border border-emerald-500/20 bg-emerald-500/10 px-3 py-2">
+                      <span className="text-xs text-emerald-300">{req.status === "delivered" ? "Total time" : "En route"}</span>
+                      {req.status === "delivered"
+                        ? <span className="font-mono text-sm font-semibold text-emerald-300">{(() => { const s = Math.max(0, Math.floor((new Date(req.deliveredAt) - new Date(req.acceptedAt)) / 1000)); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; })()}</span>
+                        : <ElapsedTimer since={req.acceptedAt} />
+                      }
+                    </div>
+                  )}
                   <button
                     type="button"
                     onClick={() => setReportReq(req)}
