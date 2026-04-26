@@ -308,6 +308,8 @@ const SPECIALTY_NAME_PATTERNS = [
   { re: /USC\s+KECK|KECK\s+HOSPITAL/,                             traumaLevel: "II",  stroke: true,  cardiac: true  },
   { re: /CALIFORNIA\s+HOSPITAL\s+MEDICAL/,                        traumaLevel: "II",  stroke: true,  cardiac: true  },
   { re: /HENRY\s+MAYO|ANTELOPE\s+VALLEY\s+HOSPITAL/,              traumaLevel: "III", stroke: true,  cardiac: false },
+  { re: /GOOD\s*SAMARITAN/,                                        traumaLevel: null,  stroke: true,  cardiac: true  },
+  { re: /SANTA\s+CLARA\s+VALLEY\s+MED/,                           traumaLevel: "I",   stroke: true,  cardiac: true  },
   // Stroke + cardiac without formal trauma designation
   { re: /KAISER/,                                                 traumaLevel: null,  stroke: true,  cardiac: true  },
   { re: /SCRIPPS\s+MERCY|UCSD\s+MEDICAL|UC\s+SAN\s+DIEGO/,       traumaLevel: "I",   stroke: true,  cardiac: true  },
@@ -424,10 +426,9 @@ function enrichSpecialty(h, specialty) {
   const apiStroke = specialty.strokeByCCN?.has(ccn) ?? false;
   const apiCardiac = specialty.cardiacByCCN?.has(ccn) ?? false;
 
-  // Apply name-pattern fallback for any field not resolved by API data
-  const fromName = (!apiTrauma && !apiStroke && !apiCardiac)
-    ? (inferSpecialtyFromName(h.hospital_name) ?? {})
-    : {};
+  // Name patterns always augment API data so hardcoded well-known hospitals
+  // are never left without a capability the API happened to miss.
+  const fromName = inferSpecialtyFromName(h.hospital_name) ?? {};
 
   return {
     traumaLevel:   apiTrauma  ?? fromName.traumaLevel  ?? null,
@@ -1570,7 +1571,7 @@ async function computeRoute(origin, condition, insurance) {
   const scored = nodes.map((node, index) => {
     const traffic = trafficResults[index];
     const availableBeds = Math.round(node.beds.inpatient_total - node.beds.inpatient_used);
-    const waitMins = Math.round(10 + node.beds.inpatient_utilization * 0.5);
+    const waitMins = Math.round(300 / (availableBeds + 5)); // ~60min at 0 beds, ~5min at 55 beds
     const utilization = node.beds.inpatient_utilization / 100;
     const status = getEffectiveStatus(node.id, utilization);
 
@@ -1580,12 +1581,19 @@ async function computeRoute(origin, condition, insurance) {
       utilization,
       availableBeds,
       distanceMiles: traffic.distanceMiles,
-      durationMins: traffic.durationMins,
+      etaMins: traffic.durationMins,
       status,
     };
   });
 
-  const ranked = [...scored].sort((a, b) => scoreHospital(b, condition) - scoreHospital(a, condition));
+  // When a specialty condition is given, restrict to capable hospitals only.
+  // Fall back to the full pool if the data has no matches (e.g. specialty data unavailable).
+  const specialtyPool = condition
+    ? scored.filter((n) => hasSpecialtyCapability(n, condition))
+    : scored;
+  const rankingPool = specialtyPool.length > 0 ? specialtyPool : scored;
+
+  const ranked = [...rankingPool].sort((a, b) => scoreHospital(b) - scoreHospital(a));
 
   let candidates = ranked;
   const insurancePool = normalizedInsurance
@@ -1604,7 +1612,7 @@ async function computeRoute(origin, condition, insurance) {
     condition: condition ?? null,
     insurance: normalizedInsurance,
     insuranceMatchFound,
-    model: "cost = (ETA + waitMins + statusPenalty) / specialtyMultiplier",
+    model: "score = -(etaMins + waitMins); waitMins from bed availability; specialty filters pool",
     closest,
     recommended,
     top3,
@@ -1706,15 +1714,16 @@ function deriveStatus(utilization) {
   return "Open";
 }
 
-function scoreHospital(node, condition) {
-  // Lower time cost = better. Specialty multiplier divides effective cost so a
-  // matched Level I trauma center or stroke-capable hospital appears "closer".
-  const STATUS_PENALTY = { Open: 0, Saturation: 0, Diversion: 3 };
-  const eta = node.durationMins || 1;
-  const waitMins = node.waitMins || 0;
-  const penalty = STATUS_PENALTY[node.status] ?? 0;
-  const multiplier = getSpecialtyMultiplier(node, condition);
-  return -(eta + waitMins + penalty) / multiplier;
+function hasSpecialtyCapability(node, condition) {
+  if (!condition) return true;
+  if (condition === "trauma") return !!node.traumaLevel;
+  if (condition === "stroke") return !!node.strokeCapable;
+  if (condition === "cardiac") return !!node.cardiacCapable;
+  return true;
+}
+
+function scoreHospital(node) {
+  return -(node.etaMins * 2 + node.waitMins);
 }
 
 function normalizeInsurance(input) {
