@@ -1020,60 +1020,69 @@ app.patch("/api/patients/:patientId/accept", authRequired, requireRole("hospital
 
 app.patch("/api/patients/:patientId/divert", authRequired, requireRole("hospital"), ah(async (req, res) => {
   const { patientId } = req.params;
+  const collection = getPatientsCollectionOrNull();
+  if (!collection) return res.status(503).json({ error: "MongoDB not configured" });
 
-  // Find the matching pending in-memory request for this patient
-  const record = Object.values(requests).find(
-    (r) => r.patientId === patientId && r.status === "pending"
-  );
-  if (!record) return res.status(404).json({ error: "no pending request found for this patient" });
+  // Read chain from MongoDB — works regardless of which machine dispatched
+  const patient = await collection.findOne({ patientId }, { projection: { _id: 0 } });
+  if (!patient) return res.status(404).json({ error: "patient not found" });
 
   const isAdminScope = String(req.user.hospitalId) === "__all__";
-  if (!isAdminScope && String(record.hospitalId) !== String(req.user.hospitalId)) {
+  const currentHospitalId = patient.assignedHospitalId ?? patient.recommendedHospitalId;
+  if (!isAdminScope && String(currentHospitalId) !== String(req.user.hospitalId)) {
     return res.status(403).json({ error: "cannot divert another hospital's request" });
   }
 
-  // Run the same divert logic as PATCH /api/requests/:requestId
-  record.status = "diverted";
-  if (escalationTimers[record.requestId]) {
-    clearTimeout(escalationTimers[record.requestId]);
-    delete escalationTimers[record.requestId];
+  const chain = patient.dispatchChain;
+  const chainIndex = patient.chainIndex ?? 0;
+
+  if (!chain || chainIndex + 1 >= chain.length) {
+    // No next hospital — mark exhausted
+    await collection.findOneAndUpdate(
+      { patientId },
+      { $set: { status: "routed", updatedAt: new Date() } }
+    );
+    return res.json({ ok: true, exhausted: true });
   }
 
-  const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
-  if (dispatch) {
-    const nextIndex = dispatch.currentIndex + 1;
-    if (nextIndex < dispatch.chain.length) {
-      dispatch.currentIndex = nextIndex;
-      const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
-      dispatch.activeRequestId = nextRequestId;
-      const nextAutoAccepted = requests[nextRequestId].status === "accepted";
-      if (nextAutoAccepted) dispatch.status = "accepted";
+  const nextIndex = chainIndex + 1;
+  const nextEntry = chain[nextIndex];
+  const currentEntry = chain[chainIndex];
+  const nextAutoAccepted = shouldAutoApprove(nextEntry.hospitalId, nextEntry);
+  const now = new Date();
 
-      const nextEntry = dispatch.chain[nextIndex];
-      const collection = getPatientsCollectionOrNull();
-      if (patientId && collection) {
-        await collection.findOneAndUpdate(
-          { patientId },
-          {
-            $set: {
-              recommendedHospitalId: nextEntry.hospitalId,
-              recommendedHospitalName: nextEntry.hospitalName,
-              assignedHospitalId: nextAutoAccepted ? nextEntry.hospitalId : null,
-              assignedHospitalName: nextAutoAccepted ? nextEntry.hospitalName : null,
-              status: nextAutoAccepted ? "accepted" : "routed",
-              acceptedAt: nextAutoAccepted ? new Date() : null,
-              updatedAt: new Date(),
-            },
-            $push: { divertHistory: { hospitalId: record.hospitalId, hospitalName: record.hospitalName, divertedToId: nextEntry.hospitalId, divertedToName: nextEntry.hospitalName, divertedAt: new Date() } },
-          },
-        );
-      }
-    } else {
-      dispatch.status = "exhausted";
+  await collection.findOneAndUpdate(
+    { patientId },
+    {
+      $set: {
+        chainIndex: nextIndex,
+        recommendedHospitalId: nextEntry.hospitalId,
+        recommendedHospitalName: nextEntry.hospitalName,
+        assignedHospitalId: nextAutoAccepted ? nextEntry.hospitalId : null,
+        assignedHospitalName: nextAutoAccepted ? nextEntry.hospitalName : null,
+        status: nextAutoAccepted ? "accepted" : "routed",
+        acceptedAt: nextAutoAccepted ? now : null,
+        updatedAt: now,
+      },
+      $push: { divertHistory: { hospitalId: currentEntry.hospitalId, hospitalName: currentEntry.hospitalName, divertedToId: nextEntry.hospitalId, divertedToName: nextEntry.hospitalName, divertedAt: now } },
+    },
+  );
+
+  // Also update in-memory dispatch if present on this server
+  const record = Object.values(requests).find((r) => r.patientId === patientId && r.status === "pending");
+  if (record) {
+    record.status = "diverted";
+    if (escalationTimers[record.requestId]) { clearTimeout(escalationTimers[record.requestId]); delete escalationTimers[record.requestId]; }
+    const dispatch = record.dispatchId ? dispatches[record.dispatchId] : null;
+    if (dispatch) {
+      dispatch.currentIndex = nextIndex;
+      const nextRequestId = createRequest(dispatch, nextIndex, currentEntry.hospitalName);
+      dispatch.activeRequestId = nextRequestId;
+      if (nextAutoAccepted) dispatch.status = "accepted";
     }
   }
 
-  return res.json({ ok: true, dispatch: dispatch ?? null });
+  return res.json({ ok: true, nextHospital: nextEntry.hospitalName, autoApproved: nextAutoAccepted });
 }));
 
 app.patch("/api/patients/:patientId/deliver", authRequired, ah(async (req, res) => {
@@ -1342,31 +1351,54 @@ app.post("/api/dispatch", authRequired, ah(async (req, res) => {
 
   const requestId = createRequest(dispatch, 0, null);
   dispatch.activeRequestId = requestId;
-  if (requests[requestId].status === "accepted") {
-    dispatch.status = "accepted";
-    if (patientId && patientsCollection) {
-      await patientsCollection.findOneAndUpdate(
-        { patientId },
-        {
-          $set: {
-            assignedHospitalId: requests[requestId].hospitalId,
-            assignedHospitalName: requests[requestId].hospitalName,
-            acceptedAt: new Date(),
-            etaMinutes: requests[requestId].etaMins,
-            status: "accepted",
-            updatedAt: new Date(),
-          },
-        }
-      );
+  const autoAccepted = requests[requestId].status === "accepted";
+  if (autoAccepted) dispatch.status = "accepted";
+
+  // Persist chain to MongoDB so any server instance can divert/escalate
+  if (patientId && patientsCollection) {
+    const mongoUpdate = {
+      dispatchChain: chain,
+      chainIndex: 0,
+      dispatchId,
+      updatedAt: new Date(),
+    };
+    if (autoAccepted) {
+      mongoUpdate.assignedHospitalId = requests[requestId].hospitalId;
+      mongoUpdate.assignedHospitalName = requests[requestId].hospitalName;
+      mongoUpdate.acceptedAt = new Date();
+      mongoUpdate.etaMinutes = requests[requestId].etaMins;
+      mongoUpdate.status = "accepted";
     }
+    await patientsCollection.findOneAndUpdate({ patientId }, { $set: mongoUpdate });
   }
 
   return res.json({ dispatchId, requestId, status: requests[requestId].status, autoApproved: requests[requestId].autoApproved });
 }));
 
-app.get("/api/dispatch/:dispatchId", authRequired, (req, res) => {
+app.get("/api/dispatch/:dispatchId", authRequired, ah(async (req, res) => {
   const dispatch = dispatches[req.params.dispatchId];
   if (!dispatch) return res.status(404).json({ error: "dispatch not found" });
+
+  // Sync from MongoDB so cross-machine accepts/diverts are visible to the EMT
+  if (dispatch.patientId && patientsCollection) {
+    const patient = await patientsCollection.findOne({ patientId: dispatch.patientId }, { projection: { _id: 0 } });
+    if (patient) {
+      if (patient.status === "accepted" && dispatch.status === "active") {
+        dispatch.status = "accepted";
+        dispatch.currentIndex = patient.chainIndex ?? dispatch.currentIndex;
+        const activeReq = requests[dispatch.activeRequestId];
+        if (activeReq && activeReq.status === "pending") {
+          activeReq.status = "accepted";
+          activeReq.acceptedAt = patient.acceptedAt?.toISOString() ?? new Date().toISOString();
+        }
+      } else if (patient.status === "delivered") {
+        dispatch.status = "delivered";
+      } else if (patient.chainIndex != null && patient.chainIndex > dispatch.currentIndex) {
+        // Another machine advanced the chain (divert)
+        dispatch.currentIndex = patient.chainIndex;
+      }
+    }
+  }
 
   const activeRequest = requests[dispatch.activeRequestId] ?? null;
   const chainWithStatus = dispatch.chain.map((entry, index) => {
@@ -1387,7 +1419,7 @@ app.get("/api/dispatch/:dispatchId", authRequired, (req, res) => {
     patientId: dispatch.patientId,
     createdAt: dispatch.createdAt,
   });
-});
+}));
 
 // --- Request endpoints ---
 
