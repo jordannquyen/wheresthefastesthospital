@@ -947,7 +947,10 @@ app.patch("/api/patients/:patientId/route", authRequired, ah(async (req, res) =>
 
   const result = await collection.findOneAndUpdate(
     { patientId: req.params.patientId },
-    { $set: updates },
+    {
+      $set: { ...updates, assignedHospitalId: null, assignedHospitalName: null, acceptedAt: null },
+      $unset: { divertHistory: "" },
+    },
     { returnDocument: "after", projection: { _id: 0 } }
   );
 
@@ -1042,21 +1045,26 @@ app.patch("/api/patients/:patientId/divert", authRequired, requireRole("hospital
       dispatch.currentIndex = nextIndex;
       const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
       dispatch.activeRequestId = nextRequestId;
-      if (requests[nextRequestId].status === "accepted") dispatch.status = "accepted";
+      const nextAutoAccepted = requests[nextRequestId].status === "accepted";
+      if (nextAutoAccepted) dispatch.status = "accepted";
 
       const nextEntry = dispatch.chain[nextIndex];
       const collection = getPatientsCollectionOrNull();
       if (patientId && collection) {
         await collection.findOneAndUpdate(
           { patientId },
-          { $set: {
-            recommendedHospitalId: nextEntry.hospitalId,
-            recommendedHospitalName: nextEntry.hospitalName,
-            assignedHospitalId: null,
-            assignedHospitalName: null,
-            status: "routed",
-            updatedAt: new Date(),
-          }},
+          {
+            $set: {
+              recommendedHospitalId: nextEntry.hospitalId,
+              recommendedHospitalName: nextEntry.hospitalName,
+              assignedHospitalId: nextAutoAccepted ? nextEntry.hospitalId : null,
+              assignedHospitalName: nextAutoAccepted ? nextEntry.hospitalName : null,
+              status: nextAutoAccepted ? "accepted" : "routed",
+              acceptedAt: nextAutoAccepted ? new Date() : null,
+              updatedAt: new Date(),
+            },
+            $push: { divertHistory: { hospitalId: record.hospitalId, hospitalName: record.hospitalName, divertedToId: nextEntry.hospitalId, divertedToName: nextEntry.hospitalName, divertedAt: new Date() } },
+          },
         );
       }
     } else {
@@ -1122,7 +1130,7 @@ app.get("/api/hospitals/:hospitalId/incoming-patients", authRequired, requireRol
   const severityOrder = { critical: 0, high: 1, moderate: 2, low: 3 };
   const query = isAllHospitals
     ? { status: { $in: INCOMING_PATIENT_STATUSES } }
-    : { status: { $in: INCOMING_PATIENT_STATUSES }, $or: [{ assignedHospitalId: hospitalId }, { recommendedHospitalId: hospitalId }] };
+    : { status: { $in: INCOMING_PATIENT_STATUSES }, $or: [{ assignedHospitalId: hospitalId }, { recommendedHospitalId: hospitalId }, { "divertHistory.hospitalId": hospitalId }] };
   const patients = await collection
     .find(query, { projection: { _id: 0 } })
     .toArray();
@@ -1464,7 +1472,8 @@ app.patch("/api/requests/:requestId", authRequired, ah(async (req, res) => {
         dispatch.currentIndex = nextIndex;
         const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
         dispatch.activeRequestId = nextRequestId;
-        if (requests[nextRequestId].status === "accepted") dispatch.status = "accepted";
+        const nextAutoAccepted = requests[nextRequestId].status === "accepted";
+        if (nextAutoAccepted) dispatch.status = "accepted";
 
         // Update MongoDB so hospital views reflect the new routing
         const nextEntry = dispatch.chain[nextIndex];
@@ -1472,14 +1481,18 @@ app.patch("/api/requests/:requestId", authRequired, ah(async (req, res) => {
         if (dispatch.patientId && collection) {
           await collection.findOneAndUpdate(
             { patientId: dispatch.patientId },
-            { $set: {
-              recommendedHospitalId: nextEntry.hospitalId,
-              recommendedHospitalName: nextEntry.hospitalName,
-              assignedHospitalId: null,
-              assignedHospitalName: null,
-              status: "routed",
-              updatedAt: new Date(),
-            }},
+            {
+              $set: {
+                recommendedHospitalId: nextEntry.hospitalId,
+                recommendedHospitalName: nextEntry.hospitalName,
+                assignedHospitalId: nextAutoAccepted ? nextEntry.hospitalId : null,
+                assignedHospitalName: nextAutoAccepted ? nextEntry.hospitalName : null,
+                status: nextAutoAccepted ? "accepted" : "routed",
+              acceptedAt: nextAutoAccepted ? new Date() : null,
+                updatedAt: new Date(),
+              },
+              $push: { divertHistory: { hospitalId: record.hospitalId, hospitalName: record.hospitalName, divertedToId: nextEntry.hospitalId, divertedToName: nextEntry.hospitalName, divertedAt: new Date() } },
+            },
           );
         }
       } else {
@@ -1618,7 +1631,8 @@ async function escalateRequest(requestId) {
       dispatch.currentIndex = nextIndex;
       const nextRequestId = createRequest(dispatch, nextIndex, record.hospitalName);
       dispatch.activeRequestId = nextRequestId;
-      if (requests[nextRequestId].status === "accepted") dispatch.status = "accepted";
+      const nextAutoAccepted = requests[nextRequestId].status === "accepted";
+      if (nextAutoAccepted) dispatch.status = "accepted";
 
       // Update MongoDB so hospital views reflect the new routing
       const nextEntry = dispatch.chain[nextIndex];
@@ -1626,14 +1640,18 @@ async function escalateRequest(requestId) {
       if (dispatch.patientId && collection) {
         await collection.findOneAndUpdate(
           { patientId: dispatch.patientId },
-          { $set: {
-            recommendedHospitalId: nextEntry.hospitalId,
-            recommendedHospitalName: nextEntry.hospitalName,
-            assignedHospitalId: null,
-            assignedHospitalName: null,
-            status: "routed",
-            updatedAt: new Date(),
-          }},
+          {
+            $set: {
+              recommendedHospitalId: nextEntry.hospitalId,
+              recommendedHospitalName: nextEntry.hospitalName,
+              assignedHospitalId: nextAutoAccepted ? nextEntry.hospitalId : null,
+              assignedHospitalName: nextAutoAccepted ? nextEntry.hospitalName : null,
+              status: nextAutoAccepted ? "accepted" : "routed",
+              acceptedAt: nextAutoAccepted ? new Date() : null,
+              updatedAt: new Date(),
+            },
+            $push: { divertHistory: { hospitalId: record.hospitalId, hospitalName: record.hospitalName, divertedToId: nextEntry.hospitalId, divertedToName: nextEntry.hospitalName, divertedAt: new Date() } },
+          },
         );
       }
     } else {

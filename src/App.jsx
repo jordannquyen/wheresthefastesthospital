@@ -412,7 +412,23 @@ function AuthenticatedApp({ user }) {
     const hospitalParam = user.hospitalId === "__all__" ? "__all__" : user.hospitalId;
     const res = await apiFetch(`/api/hospitals/${hospitalParam}/incoming-patients`);
     const data = await res.json();
-    setHospitalRequests((data.patients ?? []).map(patientToRequestCard));
+    const cards = [];
+    for (const patient of (data.patients ?? [])) {
+      // Add a diverted card for each divert history entry matching this hospital
+      if (patient.divertHistory?.length) {
+        for (const entry of patient.divertHistory) {
+          if (user.hospitalId === "__all__" || entry.hospitalId === user.hospitalId) {
+            cards.push(patientToRequestCard(patient, entry));
+          }
+        }
+      }
+      // Add the current active card if this hospital is currently routed here
+      const isCurrentHospital = user.hospitalId === "__all__"
+        || patient.assignedHospitalId === user.hospitalId
+        || patient.recommendedHospitalId === user.hospitalId;
+      if (isCurrentHospital) cards.push(patientToRequestCard(patient));
+    }
+    setHospitalRequests(cards);
   }
 
   async function handleRequest(candidate) {
@@ -1228,7 +1244,24 @@ async function saveRouteRecommendation(patientId, recommended) {
   } catch { /* non-blocking */ }
 }
 
-function patientToRequestCard(patient) {
+function patientToRequestCard(patient, divertEntry = null) {
+  if (divertEntry) {
+    return {
+      source: "patient",
+      requestId: `${patient.patientId}-diverted-${divertEntry.hospitalId}`,
+      patientId: patient.patientId,
+      hospitalId: divertEntry.hospitalId,
+      hospitalName: divertEntry.hospitalName,
+      status: "diverted",
+      divertedTo: divertEntry.divertedToName,
+      insurance: patient.insuranceProvider,
+      patientSummary: patient,
+      etaMins: patient.etaMinutes,
+      requestedAt: divertEntry.divertedAt ?? patient.createdAt ?? new Date().toISOString(),
+      acceptedAt: null,
+      deliveredAt: null,
+    };
+  }
   const status = patient.status === "delivered" ? "delivered"
     : patient.status === "accepted" ? "accepted"
     : "pending";
@@ -1340,7 +1373,7 @@ function HospitalView({ hospitalName, requests, onAccept, onDivert, onDelete }) 
                   {req.escalatedFrom && <span className="rounded-full border border-orange-400/30 bg-orange-400/10 px-2.5 py-1 text-xs font-semibold text-orange-200">Rerouted from {req.escalatedFrom}</span>}
                   {req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Auto-Approved</span>}
                   {req.status === "accepted" && !req.autoApproved && <span className="rounded-full border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1 text-xs font-semibold text-emerald-200">Accepted</span>}
-                  {req.status === "diverted" && <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-200">Diverted</span>}
+                  {req.status === "diverted" && <span className="rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-1 text-xs font-semibold text-red-200">Diverted{req.divertedTo ? ` → ${req.divertedTo}` : ""}</span>}
                   {req.status === "pending" && <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-200">Pending</span>}
                   {req.status === "delivered" && <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 text-xs font-semibold text-emerald-300">Patient Arrived</span>}
                 </div>
