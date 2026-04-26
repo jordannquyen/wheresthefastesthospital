@@ -1380,32 +1380,41 @@ app.get("/api/dispatch/:dispatchId", authRequired, ah(async (req, res) => {
   if (!dispatch) return res.status(404).json({ error: "dispatch not found" });
 
   // Sync from MongoDB so cross-machine accepts/diverts are visible to the EMT
+  let patient = null;
   if (dispatch.patientId && patientsCollection) {
-    const patient = await patientsCollection.findOne({ patientId: dispatch.patientId }, { projection: { _id: 0 } });
+    patient = await patientsCollection.findOne({ patientId: dispatch.patientId }, { projection: { _id: 0 } });
     if (patient) {
-      if (patient.status === "accepted" && dispatch.status === "active") {
-        dispatch.status = "accepted";
-        dispatch.currentIndex = patient.chainIndex ?? dispatch.currentIndex;
-        const activeReq = requests[dispatch.activeRequestId];
-        if (activeReq && activeReq.status === "pending") {
-          activeReq.status = "accepted";
-          activeReq.acceptedAt = patient.acceptedAt?.toISOString() ?? new Date().toISOString();
-        }
-      } else if (patient.status === "delivered") {
-        dispatch.status = "delivered";
-      } else if (patient.chainIndex != null && patient.chainIndex > dispatch.currentIndex) {
-        // Another machine advanced the chain (divert)
-        dispatch.currentIndex = patient.chainIndex;
-      }
+      const mongoIndex = patient.chainIndex ?? 0;
+      if (mongoIndex > dispatch.currentIndex) dispatch.currentIndex = mongoIndex;
+      if (patient.status === "accepted" && dispatch.status === "active") dispatch.status = "accepted";
+      else if (patient.status === "delivered") dispatch.status = "delivered";
     }
   }
 
   const activeRequest = requests[dispatch.activeRequestId] ?? null;
+
+  // Build chain status from MongoDB divert history + current patient state
+  // so pills are correct even when requests live on another machine
+  const divertedIds = new Set((patient?.divertHistory ?? []).map((e) => e.hospitalId));
+  const currentIdx = dispatch.currentIndex;
   const chainWithStatus = dispatch.chain.map((entry, index) => {
+    // First check in-memory (same machine)
     const r = Object.values(requests).find(
       (r) => r.dispatchId === dispatch.dispatchId && r.chainIndex === index
     );
-    return { ...entry, requestStatus: r?.status ?? null, requestId: r?.requestId ?? null, autoApproved: r?.autoApproved ?? false };
+    if (r) return { ...entry, requestStatus: r.status, requestId: r.requestId, autoApproved: r.autoApproved };
+
+    // Fall back to MongoDB-derived status
+    let requestStatus = null;
+    if (divertedIds.has(entry.hospitalId)) {
+      requestStatus = "diverted";
+    } else if (index === currentIdx && patient) {
+      if (patient.status === "accepted") requestStatus = "accepted";
+      else if (patient.status === "delivered") requestStatus = "delivered";
+      else if (patient.status === "routed" || patient.status === "active") requestStatus = "pending";
+    }
+    const autoApproved = index === currentIdx ? (patient?.assignedHospitalId === entry.hospitalId) : false;
+    return { ...entry, requestStatus, requestId: null, autoApproved };
   });
 
   return res.json({
