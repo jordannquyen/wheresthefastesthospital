@@ -1747,7 +1747,7 @@ function createRequest(dispatch, chainIndex, escalatedFromName) {
     acceptedAt: autoApproved ? new Date().toISOString() : null,
   };
   if (!autoApproved) {
-    escalationTimers[requestId] = setTimeout(() => escalateRequest(requestId), 60_000);
+    escalationTimers[requestId] = setTimeout(() => escalateRequest(requestId), 300_000);
   }
   return requestId;
 }
