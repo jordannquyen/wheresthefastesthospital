@@ -34,8 +34,8 @@ function buildPickedOverDiff(a, b) {
   if (!a || !b) return "";
   const parts = [];
 
-  if (a.durationMins != null && b.durationMins != null && b.durationMins > 0) {
-    const pct = Math.round(((b.durationMins - a.durationMins) / b.durationMins) * 100);
+  if (a.etaMins != null && b.etaMins != null && b.etaMins > 0) {
+    const pct = Math.round(((b.etaMins - a.etaMins) / b.etaMins) * 100);
     if (pct >= 10) parts.push(`${pct}% lower ETA`);
   }
 
@@ -422,7 +422,7 @@ function AuthenticatedApp({ user }) {
         chain: [{
           hospitalId: candidate.id,
           hospitalName: candidate.name,
-          etaMins: candidate.durationMins,
+          etaMins: candidate.etaMins,
           utilization: candidate.utilization,
           availableBeds: candidate.availableBeds,
           waitMins: candidate.waitMins,
@@ -439,7 +439,7 @@ function AuthenticatedApp({ user }) {
     const chain = route.top3.map((c) => ({
       hospitalId: c.id,
       hospitalName: c.name,
-      etaMins: c.durationMins,
+      etaMins: c.etaMins,
       utilization: c.utilization,
       availableBeds: c.availableBeds,
       waitMins: c.waitMins,
@@ -705,7 +705,7 @@ function AuthenticatedApp({ user }) {
     const chain = routeData.top3.map((c) => ({
       hospitalId: c.id,
       hospitalName: c.name,
-      etaMins: c.durationMins,
+      etaMins: c.etaMins,
       utilization: c.utilization,
       availableBeds: c.availableBeds,
       waitMins: c.waitMins,
@@ -881,7 +881,7 @@ function AuthenticatedApp({ user }) {
                         <p className="text-xs">ICU util: {selectedStats.icuUtilization}%</p>
                         <p className="text-xs">Est. wait: {selectedStats.waitMins} min</p>
                         {selectedHospital.distanceMiles != null && (
-                          <p className="text-xs">Drive: {selectedHospital.distanceMiles} mi / {selectedHospital.durationMins} min</p>
+                          <p className="text-xs">Drive: {selectedHospital.distanceMiles} mi / {selectedHospital.etaMins} min</p>
                         )}
                       </div>
                     </InfoWindowF>
@@ -1022,10 +1022,7 @@ function AuthenticatedApp({ user }) {
                 {!route && <p className="mt-2 text-sm text-slate-300">Click anywhere on the map, type an address, or tap the mic to start.</p>}
                 {route && (
                   <div className="mt-2 space-y-3 text-sm">
-                    <p className="rounded-md border border-slate-700 bg-slate-900/60 p-2 text-slate-200">
-                      Model: <span className="font-mono text-cyan-300">{route.model}</span>
-                    </p>
-                    {route.closest && <p>Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.durationMins} min)</p>}
+                    {route.closest && <p>Closest: <span className="font-semibold text-slate-100">{route.closest.name}</span> ({route.closest.distanceMiles} mi, {route.closest.etaMins} min)</p>}
                     <div className="space-y-2 pt-1">
                       {(route.top3 || []).map((candidate, index) => {
                         const chainEntry = dispatch?.chain?.find((e) => e.hospitalId === candidate.id);
@@ -1065,7 +1062,7 @@ function AuthenticatedApp({ user }) {
                             </div>
                           )}
                           <p className="mt-1 text-xs text-slate-300">
-                            {candidate.distanceMiles} mi ({candidate.durationMins} min) | {candidate.availableBeds} beds avail ({Math.round(candidate.utilization * 100)}% util) | {candidate.waitMins} min wait
+                            {candidate.distanceMiles} mi ({candidate.etaMins} min) | {candidate.availableBeds} beds avail ({Math.round(candidate.utilization * 100)}% util) | {candidate.waitMins} min wait
                           </p>
                           {index === 0 && route.top3[1] && buildPickedOverDiff(route.top3[0], route.top3[1]) && (
                             <p className="mt-1 text-[11px] italic text-cyan-300/80">
@@ -1221,7 +1218,7 @@ async function saveRouteRecommendation(patientId, recommended) {
       body: JSON.stringify({
         recommendedHospitalId: recommended.id,
         recommendedHospitalName: recommended.name,
-        etaMinutes: recommended.durationMins,
+        etaMinutes: recommended.etaMins,
         routingReason: "Best ranked hospital based on ETA, wait time, capacity, and status.",
       }),
     });
