@@ -988,6 +988,7 @@ app.patch("/api/patients/:patientId/accept", authRequired, requireRole("hospital
     assignedHospitalName: String(hospitalName).trim(),
     acceptedAt: new Date(),
     status: "accepted",
+    autoApproved: false,
     updatedAt: new Date(),
   };
   if (hasValue(etaMinutes)) {
@@ -1061,6 +1062,7 @@ app.patch("/api/patients/:patientId/divert", authRequired, requireRole("hospital
         assignedHospitalId: nextAutoAccepted ? nextEntry.hospitalId : null,
         assignedHospitalName: nextAutoAccepted ? nextEntry.hospitalName : null,
         status: nextAutoAccepted ? "accepted" : "routed",
+              autoApproved: nextAutoAccepted,
         acceptedAt: nextAutoAccepted ? now : null,
         updatedAt: now,
       },
@@ -1368,6 +1370,9 @@ app.post("/api/dispatch", authRequired, ah(async (req, res) => {
       mongoUpdate.acceptedAt = new Date();
       mongoUpdate.etaMinutes = requests[requestId].etaMins;
       mongoUpdate.status = "accepted";
+      mongoUpdate.autoApproved = true;
+    } else {
+      mongoUpdate.autoApproved = false;
     }
     await patientsCollection.findOneAndUpdate({ patientId }, { $set: mongoUpdate });
   }
@@ -1385,7 +1390,17 @@ app.get("/api/dispatch/:dispatchId", authRequired, ah(async (req, res) => {
     patient = await patientsCollection.findOne({ patientId: dispatch.patientId }, { projection: { _id: 0 } });
     if (patient) {
       const mongoIndex = patient.chainIndex ?? 0;
-      if (mongoIndex > dispatch.currentIndex) dispatch.currentIndex = mongoIndex;
+      if (mongoIndex > dispatch.currentIndex) {
+        // Another machine advanced the chain — cancel stale escalation timers
+        // so Jordan's server doesn't create ghost requests for hospitals already diverted
+        for (const [rid, req] of Object.entries(requests)) {
+          if (req.dispatchId === dispatch.dispatchId && req.chainIndex < mongoIndex && req.status === "pending") {
+            req.status = "diverted";
+            if (escalationTimers[rid]) { clearTimeout(escalationTimers[rid]); delete escalationTimers[rid]; }
+          }
+        }
+        dispatch.currentIndex = mongoIndex;
+      }
       if (patient.status === "accepted" && dispatch.status === "active") dispatch.status = "accepted";
       else if (patient.status === "delivered") dispatch.status = "delivered";
     }
@@ -1413,7 +1428,7 @@ app.get("/api/dispatch/:dispatchId", authRequired, ah(async (req, res) => {
       else if (patient.status === "delivered") requestStatus = "delivered";
       else if (patient.status === "routed" || patient.status === "active") requestStatus = "pending";
     }
-    const autoApproved = index === currentIdx ? (patient?.assignedHospitalId === entry.hospitalId) : false;
+    const autoApproved = index === currentIdx ? (patient?.autoApproved === true) : false;
     return { ...entry, requestStatus, requestId: null, autoApproved };
   });
 
@@ -1530,6 +1545,7 @@ app.patch("/api/requests/:requestId", authRequired, ah(async (req, res) => {
                 assignedHospitalId: nextAutoAccepted ? nextEntry.hospitalId : null,
                 assignedHospitalName: nextAutoAccepted ? nextEntry.hospitalName : null,
                 status: nextAutoAccepted ? "accepted" : "routed",
+              autoApproved: nextAutoAccepted,
               acceptedAt: nextAutoAccepted ? new Date() : null,
                 updatedAt: new Date(),
               },
@@ -1696,6 +1712,7 @@ async function escalateRequest(requestId) {
               assignedHospitalId: nextAutoAccepted ? nextEntry.hospitalId : null,
               assignedHospitalName: nextAutoAccepted ? nextEntry.hospitalName : null,
               status: nextAutoAccepted ? "accepted" : "routed",
+              autoApproved: nextAutoAccepted,
               acceptedAt: nextAutoAccepted ? new Date() : null,
               updatedAt: new Date(),
             },
