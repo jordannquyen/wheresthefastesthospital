@@ -1374,7 +1374,17 @@ function HospitalView({ hospitalName, requests, onAccept, onDivert, onDelete }) 
                   {req.status === "pending" && <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-200">Pending</span>}
                   {req.status === "delivered" && <span className="rounded-full border border-emerald-500/40 bg-emerald-500/15 px-2.5 py-1 text-xs font-semibold text-emerald-300">Patient Arrived</span>}
                 </div>
-                <p className="mt-3 font-semibold text-slate-100">{req.hospitalName}</p>
+                <p className="mt-3 font-semibold text-slate-100">
+                  {(() => {
+                    const p = req.patientSummary;
+                    const parts = [];
+                    if (p?.age) parts.push(`${p.age}-year-old`);
+                    if (p?.sex) parts.push(p.sex);
+                    if (p?.chiefComplaint || p?.summary) parts.push(p.chiefComplaint || p.summary);
+                    return parts.length ? parts.join(" ") : req.hospitalName;
+                  })()}
+                </p>
+                <p className="text-xs text-slate-400">{req.hospitalName}</p>
                 <div className="mt-2 space-y-1 text-sm text-slate-300">
                   <p>ETA: <span className="text-slate-100">{req.etaMins != null ? `${req.etaMins} min` : "--"}</span></p>
                   {req.insurance && <p>Insurance: <span className="text-slate-100">{req.insurance}</span></p>}
