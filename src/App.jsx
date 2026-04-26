@@ -835,25 +835,29 @@ function AuthenticatedApp({ user }) {
                   onClick={handleMapClick}
                 >
 
-                  {nodes.map((node) => {
-                    const util = nodeUtilization(node);
-                    return (
-                      <MarkerF
-                        key={`marker-${node.id}`}
-                        position={{ lat: node.lat, lng: node.lng }}
-                        title={`${node.name} (${Math.round(util * 100)}% utilized)`}
-                        onClick={() => setSelectedHospitalId(node.id)}
-                        icon={{
-                          path: window.google.maps.SymbolPath.CIRCLE,
-                          scale: 8,
-                          fillColor: getNodeColor(util),
-                          fillOpacity: 1,
-                          strokeColor: "#e2e8f0",
-                          strokeWeight: 1.2,
-                        }}
-                      />
-                    );
-                  })}
+                  {(() => {
+                    const top3Ids = route?.top3?.length ? new Set(route.top3.map((c) => c.id)) : null;
+                    const visibleNodes = top3Ids ? nodes.filter((n) => top3Ids.has(n.id)) : nodes;
+                    return visibleNodes.map((node) => {
+                      const util = nodeUtilization(node);
+                      return (
+                        <MarkerF
+                          key={`marker-${node.id}`}
+                          position={{ lat: node.lat, lng: node.lng }}
+                          title={`${node.name} (${Math.round(util * 100)}% utilized)`}
+                          onClick={() => setSelectedHospitalId(node.id)}
+                          icon={{
+                            path: window.google.maps.SymbolPath.CIRCLE,
+                            scale: 8,
+                            fillColor: getNodeColor(util),
+                            fillOpacity: 1,
+                            strokeColor: "#e2e8f0",
+                            strokeWeight: 1.2,
+                          }}
+                        />
+                      );
+                    });
+                  })()}
 
                   {origin && <MarkerF position={origin} title="Patient Origin" />}
 
