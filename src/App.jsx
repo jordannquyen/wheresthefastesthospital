@@ -428,6 +428,7 @@ function AuthenticatedApp({ user }) {
         || patient.recommendedHospitalId === user.hospitalId;
       if (isCurrentHospital) cards.push(patientToRequestCard(patient));
     }
+    cards.sort((a, b) => new Date(b.requestedAt) - new Date(a.requestedAt));
     setHospitalRequests(cards);
   }
 
